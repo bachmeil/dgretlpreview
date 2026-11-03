@@ -1,6 +1,8 @@
 # dgretlpreview
 
-A preview release of **dgretl**: [libgretl](https://gretl.sourceforge.net/) (the econometrics library behind gretl) ported to D, with an idiomatic D front end.
+**Disclosure:** Most of the work was done by Claude. It is a port with a more convenient interface to the low-level functionality. There will be changes in the future and more human involvement now that there is a foundation to build on.
+
+This repo is a preview release of **dgretl**: [libgretl](https://gretl.sourceforge.net/) (the econometrics library behind gretl) ported to D, with an idiomatic D front end.
 
 ```d
 import dgretl;
