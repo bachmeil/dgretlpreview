@@ -1,0 +1,40 @@
+name "dgretl"
+description "A D port of libgretl, the econometrics library behind gretl, with an idiomatic D front end"
+authors "Lance Bachmeier"
+copyright "The gretl authors and Lance Bachmeier"
+license "GPL-3.0-or-later"
+
+targetType "library"
+targetPath "build"
+
+# the direct ports of libgretl (gretl, gretl/plugin, gretl/minpack), the cephes library, and the D front end;
+# a program only needs `import dgretl;`
+sourcePaths "gretl" "cephes" "dgretl"
+importPaths "."
+excludedSourceFiles "dgretl/slowPrng.d"
+
+# runtime stand-ins for the few libgretl functions that are not ported yet and that the port needs to run
+sourceFiles "testing/stubs.d"
+
+# aborting stand-ins for all the other unported functions; separate package because the ported modules declare
+# these functions with their real signatures, which LDC will not accept in the same compilation
+dependency "dgretl:stubs" version="*"
+subPackage {
+    name "stubs"
+    description "Aborting stand-ins for the libgretl functions that dgretl does not port yet"
+    targetType "staticLibrary"
+    targetPath "build"
+    sourceFiles "testing/stubs_unported.d"
+}
+
+libs "xml2" "z" "lapack" "blas" "fftw3" "m" platform="posix"
+
+# Windows (LDC, MSVC target, libraries from vcpkg x64-windows; see guide/installing-and-building.md): put
+# vcpkg\installed\x64-windows\lib on the LIB environment variable, and bin on PATH. The BLAS is openblas_clean.lib, which
+# testing\build_win.ps1 makes from openblas.dll (the vcpkg import library of OpenBLAS also defines printf and others);
+# LAPACK comes from the vcpkg clapack port (lapack, libf2c). The C runtime must be the dynamic one, like the DLLs.
+libs "libxml2" "lapack" "libf2c" "fftw3" "iconv" "charset" "openblas_clean" platform="windows"
+lflags "/LIBPATH:$PACKAGE_DIR/testing/build" "/NODEFAULTLIB:libcmt" platform="windows"
+# -lowmem turns on the compiler's own garbage collector: without it LDC 1.41 on Windows gives random errors or crashes
+# (illegal instruction, bogus "template not callable") when compiling this many modules in one run
+dflags "-mscrtlib=msvcrt" "-lowmem" platform="windows"

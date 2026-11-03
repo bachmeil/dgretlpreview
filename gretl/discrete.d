@@ -1,0 +1,4203 @@
+/* Port of lib/src/discrete.c: models for limited dependent variables and related cases (binary, ordered and
+   multinomial logit and probit, logistic, Fisher's exact test and a few utilities).
+
+   Differences from the C:
+   - the LPDEBUG diagnostics (compiled out in the C) and the LIKE_STATA alternative are not ported;
+   - the file-internal structs op_container_, mnl_info_, bin_info_ and sorter are OpContainer, MnlInfo, BinInfo
+     and Sorter;
+   - the dPMIN macro is an enum.
+   Dependencies not yet ported are declared extern (C) below, in the style of the other ports. */
+
+module gretl.discrete;
+
+
+import core.stdc.errno : errno;
+import core.stdc.math : exp, fabs, floor, log, pow, sqrt;
+import core.stdc.stdio : fprintf, sprintf, stderr;
+import core.stdc.stdlib : calloc, free, malloc, qsort, realloc;
+import core.stdc.string : memcpy, strcpy;
+
+import std.algorithm : max, min;
+
+import gretl.gretl_errorsh : GretlError;
+import gretl.gretl_matrix;
+import gretl.gretl_matrixh;
+import gretl.libgretlh;
+import gretl.missingh : NADBL, na;
+import core.bitop : bsf;
+import gretl.gretl_bfgsh : BFGS_CRIT_FUNC;
+import core.stdc.math : isnan;
+import core.stdc.errno : ERANGE;
+import std.math : PI;
+import gretl.nlsh : CriterionType;
+import gretl.compareh : ModelAuxCode;
+import gretl.gretl_modelh : ModelTestType;
+import gretl.libseth : OptimCode, SetKey;
+import core.stdc.math : nearbyint;
+import gretl.dataset : dataset_add_series, dataset_drop_last_variables, series_is_discrete;
+import gretl.dataseth : dataset_is_panel;
+import gretl.describe : gretl_mean, gretl_stddev;
+import gretl.describeh : Xtab;
+import gretl.estimate : lsq, makevcv, panel_model;
+import gretl.gretl_bfgsh : BFGS_GRAD_FUNC, HESS_FUNC;
+import gretl.gretl_commandsh : GretlCmdIndex;
+import gretl.gretl_errors : gretl_errmsg_set, gretl_errmsg_sprintf, gretl_error_clear;
+import gretl.gretl_list : gretl_list_const_pos, gretl_list_copy, gretl_list_delete_at_pos, gretl_list_new, gretl_list_separator_position, gretl_list_sublist, in_gretl_list;
+import gretl.gretl_listh : LISTSEP;
+import gretl.gretl_model : ModelTest, clear_model, clear_model_xpx, conf_intervals_matrix, free_coeff_intervals, gretl_model_add_QML_vcv, gretl_model_add_hessian_vcv, gretl_model_add_normality_test, gretl_model_allocate_param_names, gretl_model_destroy_data_item, gretl_model_get_coeff_intervals, gretl_model_get_data, gretl_model_get_int, gretl_model_get_test, gretl_model_init, gretl_model_set_coeff_separator, gretl_model_set_data, gretl_model_set_double, gretl_model_set_int, gretl_model_set_matrix_as_data, gretl_model_set_param_name, gretl_model_steal_data, gretl_model_write_coeffs, gretl_model_write_vcv, mle_criteria, model_test_set_opt, model_test_set_pvalue, set_model_id;
+import gretl.gretl_modelh : CoeffIntervals;
+import gretl.gretl_prn : Prn, pprintf, pputc;
+import gretl.gretl_string_table : retrieve_date_string;
+import gretl.gretl_utils : count_distinct_values, gretl_compare_doubles, gretl_is_oprobit_ok, gretl_iscount, gretl_isdummy, ls_criteria;
+import gretl.libset : libset_get_int;
+import gretl.matrix_extra : gretl_vcv_matrix_from_model;
+import gretl.missing : copy_to_reference_missmask, list_adjust_sample, model_missing;
+import gretl.options : get_optval_int;
+import gretl.plugins : get_plugin_function;
+import gretl.pvalues : lngamma, normal_cdf, normal_cdf_inverse, normal_pdf;
+import gretl.qr_estimate : set_cluster_vcv_ci;
+import gretl.strutils : gretl_strdup, strings_array_new;
+import gretl.transforms : list_dumgenr;
+import gretl.gretl_bfgs : BFGS_defaults, BFGS_max, newton_raphson_max;
+import gretl.gretl_normal : invmills;
+import gretl.gretl_commands : gretl_command_word;
+import gretl.random : gretl_one_snormal;
+
+/* unported dependencies: per-file declarations from the 2026c headers */
+extern (C) {
+}
+/* structure for handling ordered probit or logit */
+
+struct OpContainer {
+    int ci; /* model command index (PROBIT or LOGIT) */
+    Gretlopt opt; /* option flags */
+    int bootstrap; /* state: doing bootstrap of normality test */
+    int * y; /* dependent variable */
+    double ** Z; /* data */
+    int * list; /* dependent var plus regular regressors */
+    int ymin; /* minimum of original y values */
+    int ymax; /* max of (possibly normalized) y */
+    int t1; /* beginning of sample */
+    int t2; /* end of sample */
+    int nobs; /* number of observations */
+    int nx; /* number of explanatory variables */
+    int k; /* total number of parameters */
+    double * theta; /* real parameter estimates */
+    double * ndx; /* index variable */
+    double * dP; /* probabilities */
+    Model * pmod; /* model struct, initially containing OLS */
+    GretlMatrixRaw * G; /* score matrix by observation */
+    double * g; /* total score vector */
+    GretlMatrixRaw * nty; /* dependent var for normality test */
+    GretlMatrixRaw * ntb; /* coefficients, normality test */
+    double X20; /* original value of normality test */
+    int replics; /* replications of normtest */
+    int X2_ngt; /* times X20 exceeded in bootstrap */
+}
+
+struct Sorter {
+    double x;
+    int t;
+}
+
+double lp_cdf(double x, int ci)
+{
+    switch (ci) {
+    case GretlCmdIndex.probit:
+        return normal_cdf(x);
+    case GretlCmdIndex.logit:
+        return 1.0 / (1.0 + exp(-x));
+    default:
+        return NADBL;
+    }
+}
+
+double lp_pdf(double x, int ci)
+{
+    double tmp;
+
+    switch (ci) {
+    case GretlCmdIndex.probit:
+        return normal_pdf(x);
+    case GretlCmdIndex.logit:
+        tmp = 1.0 + exp(-x);
+        return (tmp - 1.0) / (tmp * tmp);
+    default:
+        return NADBL;
+    }
+}
+
+void op_container_destroy(OpContainer * OC)
+{
+    free(OC.y);
+    free(OC.ndx);
+    free(OC.dP);
+    free(OC.list);
+    free(OC.g);
+    free(OC.theta);
+
+    gretl_matrix_free(OC.G);
+    gretl_matrix_free(OC.nty);
+    gretl_matrix_free(OC.ntb);
+
+    free(OC);
+}
+
+OpContainer * op_container_new(int ci, int ndum, int ymin, double ** Z, Model * pmod, Gretlopt opt)
+{
+    OpContainer * OC;
+    int i, t, vy = pmod.list[1];
+    int nobs = pmod.nobs;
+    int err = 0;
+
+    OC = cast(typeof(OC)) malloc((*OC).sizeof);
+    if (OC == null) {
+        return null;
+    }
+
+    OC.ci = ci;
+    OC.opt = opt;
+    OC.bootstrap = 0;
+
+    OC.Z = Z;
+    OC.pmod = pmod;
+    OC.t1 = pmod.t1;
+    OC.t2 = pmod.t2;
+    OC.nobs = nobs;
+    OC.k = pmod.ncoeff;
+    OC.ymin = ymin;
+    OC.ymax = ndum;
+    OC.nx = OC.k - ndum;
+
+    OC.y = null;
+    OC.ndx = null;
+    OC.dP = null;
+    OC.list = null;
+    OC.g = null;
+    OC.theta = null;
+    OC.G = null;
+    OC.nty = null;
+    OC.ntb = null;
+
+    OC.y = cast(typeof(OC.y)) malloc(nobs * (*OC.y).sizeof);
+    OC.ndx = cast(typeof(OC.ndx)) malloc(nobs * (*OC.ndx).sizeof);
+    OC.dP = cast(typeof(OC.dP)) malloc(nobs * (*OC.dP).sizeof);
+
+    OC.list = gretl_list_new(1 + OC.nx);
+    OC.g = cast(typeof(OC.g)) malloc(OC.k * (*OC.g).sizeof);
+    OC.theta = cast(typeof(OC.theta)) malloc(OC.k * (*OC.theta).sizeof);
+
+    if (OC.y == null || OC.ndx == null ||
+        OC.dP == null || OC.list == null ||
+        OC.g == null || OC.theta == null) {
+        op_container_destroy(OC);
+        return null;
+    }
+
+    if (ci == GretlCmdIndex.probit) {
+        /* include extra storage for normality test */
+        OC.G = gretl_matrix_alloc(nobs, OC.k + 2);
+        OC.nty = gretl_matrix_alloc(nobs, 1);
+        OC.ntb = gretl_matrix_alloc(OC.k + 2, 1);
+        if (OC.G == null || OC.nty == null || OC.ntb == null) {
+            err = GretlError.alloc;
+        } else {
+            /* "shrink" G to proper size for gradient */
+            gretl_matrix_reuse(OC.G, -1, OC.k);
+        }
+    } else {
+        OC.G = gretl_matrix_alloc(nobs, OC.k);
+        if (OC.G == null) {
+            err = GretlError.alloc;
+        }
+    }
+
+    if (err) {
+        op_container_destroy(OC);
+        return null;
+    }
+
+    i = 0;
+    for (t=pmod.t1; t<=pmod.t2; t++) {
+        if (!na(pmod.uhat[t])) {
+            OC.y[i++] = cast(int) Z[vy][t];
+        }
+    }
+
+    OC.list[1] = vy;
+    for (i=0; i<OC.nx; i++) {
+        OC.list[i+2] = pmod.list[i+2];
+    }
+
+    /* for probit normality test bootstrap */
+    OC.X20 = NADBL;
+    OC.replics = 0;
+    OC.X2_ngt = 0;
+
+    return OC;
+}
+
+int op_compute_score(OpContainer * OC, int yt, double ystar0, double ystar1, double dP, int t, int s)
+{
+    double gsi, dm, mills0, mills1;
+    int M = OC.ymax;
+    int i, v;
+
+    if (ystar1 < 6.0 || OC.ci == GretlCmdIndex.logit) {
+        mills0 = (yt == 0)? 0.0 : lp_pdf(ystar0, OC.ci) / dP;
+        mills1 = (yt == M)? 0.0 : lp_pdf(ystar1, OC.ci) / dP;
+    } else {
+        /* L'Hôpital-based approximation */
+        mills0 = (yt == 0)? 0.0 : -ystar0;
+        mills1 = (yt == M)? 0.0 : -ystar1;
+    }
+
+    dm = mills1 - mills0;
+
+    for (i=0; i<OC.nx; i++) {
+        v = OC.list[i+2];
+        gsi = -dm * OC.Z[v][t];
+        gretl_matrix_set(OC.G, s, i, gsi);
+        OC.g[i] += gsi;
+    }
+
+    for (i=OC.nx; i<OC.k; i++) {
+        gretl_matrix_set(OC.G, s, i, 0.0);
+        if (i == OC.nx + yt - 1) {
+            gsi = -mills0;
+            gretl_matrix_set(OC.G, s, i, gsi);
+            OC.g[i] += gsi;
+        }
+        if (i == OC.nx + yt) {
+            gsi = mills1;
+            gretl_matrix_set(OC.G, s, i, gsi);
+            OC.g[i] += gsi;
+        }
+    }
+
+    return 0;
+}
+
+enum dPMIN = 1.0e-15;
+
+int op_compute_probs(const(double) * theta, OpContainer * OC)
+{
+    double m0, m1, ystar0 = 0.0, ystar1 = 0.0;
+    int M = OC.ymax;
+    int nx = OC.nx;
+    double P0, P1, h, adj, dP;
+    int i, t, s, yt;
+
+    /* initialize analytical score */
+    for (i=0; i<OC.k; i++) {
+        OC.g[i] = 0.0;
+    }
+
+    s = 0;
+    for (t=OC.pmod.t1; t<=OC.pmod.t2; t++) {
+        if (na(OC.pmod.uhat[t])) {
+            continue;
+        }
+        yt = OC.y[s];
+        if (yt == 0) {
+            m0 = theta[nx];
+            ystar1 = OC.ndx[s] + m0;
+        } else {
+            m0 = theta[nx + yt - 1];
+            ystar0 = OC.ndx[s] + m0;
+            if (yt < M) {
+                m1 = theta[nx + yt];
+                ystar1 = OC.ndx[s] + m1;
+            }
+        }
+        if (ystar0 < 6.0 || OC.ci == GretlCmdIndex.logit) {
+            P0 = (yt == 0)? 0.0 : lp_cdf(ystar0, OC.ci);
+            P1 = (yt == M)? 1.0 : lp_cdf(ystar1, OC.ci);
+            dP = P1 - P0;
+        } else {
+            /* Taylor-based 1st order approximation */
+            h = ystar1 - ystar0;
+            adj = lp_pdf(ystar1, OC.ci) + lp_pdf(ystar0, OC.ci);
+            dP =  0.5 * h * adj;
+        }
+        if (dP > dPMIN) {
+            OC.dP[s] = dP;
+        } else {
+            return 1;
+        }
+        op_compute_score(OC, yt, ystar0, ystar1, dP, t, s);
+        s++;
+    }
+
+    return 0;
+}
+
+/* Below: method for getting around the "non-increasing cut point"
+   issue in ordered models by construction: the 2nd and higher cut
+   points are represented to the optimizer in the form of the
+   log-difference from the previous cut point.
+*/
+
+void op_transform_theta(OpContainer * OC, double * theta)
+{
+    int i;
+
+    for (i=0; i<=OC.nx; i++) {
+        theta[i] = OC.theta[i];
+    }
+
+    for (i=OC.nx+1; i<OC.k; i++) {
+        /* convert cut point 2 and higher to log-difference form */
+        theta[i] = log(OC.theta[i] - OC.theta[i-1]);
+    }
+}
+
+/* Inverse operation for the transformation done by
+   op_transform_theta() */
+
+void op_get_real_theta(OpContainer * OC, const(double) * theta)
+{
+    int i;
+
+    for (i=0; i<=OC.nx; i++) {
+        OC.theta[i] = theta[i];
+    }
+
+    for (i=OC.nx+1; i<OC.k; i++) {
+        /* retrieve cut point 2 and higher from log-difference form */
+        OC.theta[i] = exp(theta[i]) + OC.theta[i-1];
+    }
+}
+
+extern (C) double op_loglik(const(double) * theta, void * ptr)
+{
+    OpContainer * OC = cast(OpContainer *) ptr;
+    double x, ll = 0.0;
+    int i, s, t, v;
+    int err;
+
+    if (theta != OC.theta) {
+        op_get_real_theta(OC, theta);
+    }
+
+    s = 0;
+    for (t=OC.t1; t<=OC.t2; t++) {
+        if (na(OC.pmod.uhat[t])) {
+            continue;
+        }
+        x = 0.0;
+        for (i=0; i<OC.nx; i++) {
+            /* the independent variables */
+            v = OC.list[i+2];
+            x -= OC.theta[i] * OC.Z[v][t];
+        }
+        OC.ndx[s++] = x;
+    }
+
+    err = op_compute_probs(OC.theta, OC);
+    if (err) {
+        ll = NADBL;
+    } else {
+        s = 0;
+        for (t=OC.t1; t<=OC.t2; t++) {
+            if (!na(OC.pmod.uhat[t])) {
+                ll += log(OC.dP[s++]);
+            }
+        }
+    }
+
+    return ll;
+}
+
+extern (C) int op_score(double * theta, double * s, int npar, BFGS_CRIT_FUNC ll, void * ptr)
+{
+    OpContainer * OC = cast(OpContainer *) ptr;
+    int i, j;
+
+    for (i=0; i<npar; i++) {
+        s[i] = OC.g[i];
+    }
+
+    for (i=OC.nx; i<npar; i++) {
+        for (j=i+1; j<npar; j++) {
+            /* add effects of changes in subsequent cut points */
+            s[i] += OC.g[j];
+        }
+        if (i > OC.nx) {
+            s[i] *= exp(theta[i]); /* apply jacobian */
+        }
+    }
+
+    return 0;
+}
+
+int ordered_hessian(OpContainer * OC, GretlMatrixRaw * H)
+{
+    double smal = 1.0e-09; /* "small" is some sort of macro on win32 */
+    double dx, dx2;
+    double ti;
+    double x;
+    double ll;
+    double * g0;
+    int i, j, k = OC.k;
+    int err = 0;
+
+    g0 = cast(typeof(g0)) malloc(k * (*g0).sizeof);
+    if (g0 == null) {
+        return GretlError.alloc;
+    }
+
+    for (i=0; i<k; i++) {
+        ti = OC.theta[i];
+        dx = (fabs(ti) > 0.001) ? fabs(ti) * smal : smal;
+        dx2 = 2.0 * dx;
+        OC.theta[i] -= dx;
+        ll = op_loglik(OC.theta, OC);
+        if (na(ll)) {
+            OC.theta[i] = ti;
+            err = GretlError.data;
+            break;
+        }
+        for (j=0; j<k; j++) {
+            g0[j] = OC.g[j];
+        }
+        OC.theta[i] += dx2;
+        ll = op_loglik(OC.theta, OC);
+        if (na(ll)) {
+            OC.theta[i] = ti;
+            err = GretlError.data;
+            break;
+        }
+        for (j=0; j<k; j++) {
+            x = (OC.g[j] - g0[j]) / dx2;
+            gretl_matrix_set(H, i, j, -x);
+        }
+        /* restore original theta */
+        OC.theta[i] = ti;
+    }
+
+    free(g0);
+
+    if (!err) {
+        gretl_matrix_xtr_symmetric(H);
+    }
+
+    return err;
+}
+
+GretlMatrixRaw * ordered_hessian_inverse(OpContainer * OC, int * err)
+{
+    GretlMatrixRaw * H = gretl_zero_matrix_new(OC.k, OC.k);
+
+    if (H == null) {
+        *err = GretlError.alloc;
+    } else {
+        *err = ordered_hessian(OC, H);
+    }
+
+    if (!*err) {
+        *err = gretl_invert_symmetric_matrix(H);
+        if (*err) {
+            fprintf(stderr, "ordered_hessian_inverse: inversion failed\n".ptr);
+        }
+    }
+
+    if (H != null && *err) {
+        gretl_matrix_free(H);
+        H = null;
+    }
+
+    return H;
+}
+
+/**
+ * ordered_model_prediction:
+ * @pmod: model for ordered data, either logit or probit.
+ * @Xb: X\beta, the value of the index function at a given
+ * observation.
+ * @ymin: the minimum value of the dependent variable.
+ *
+ * Returns: the "predicted value" of the (ordinal) dependent variable,
+ * taken to be the value for which the estimated probability is greatest.
+ */
+
+double ordered_model_prediction(const(Model) * pmod, double Xb, int ymin)
+{
+    /* position of least cut point in coeff array */
+    int k = gretl_model_get_int(pmod, "nx");
+    int maxval = pmod.ncoeff - k;
+    double prob, pmax, cut;
+    double CDF, CDFbak;
+    int i, pred = ymin;
+
+    cut = pmod.coeff[k];
+    pmax = CDFbak = lp_cdf(cut - Xb, pmod.ci);
+
+    for (i=1; i<maxval; i++) {
+        cut = pmod.coeff[++k];
+        CDF = lp_cdf(cut - Xb, pmod.ci);
+        prob = CDF - CDFbak;
+        if (prob > pmax) {
+            pmax = prob;
+            pred = ymin + i;
+        }
+        CDFbak = CDF;
+    }
+
+    prob = 1 - CDFbak;
+    if (prob > pmax) {
+        pred = ymin + maxval;
+    }
+
+    return cast(double) pred;
+}
+
+GretlMatrixRaw * ordered_probabilities(const(Model) * pmod, const(double) * zhat, int t1, int t2, const(DatasetRaw) * dset, int * err)
+{
+    GretlMatrixRaw * P;
+    int k = gretl_model_get_int(pmod, "nx");
+    const(double) * c = pmod.coeff + k;
+    int ncut = pmod.ncoeff - k;
+    int n = t2 - t1 + 1;
+    int ci = pmod.ci;
+    char ** S = null;
+    double zht, pij;
+    int i, t, j;
+
+    P = gretl_matrix_alloc(n, ncut+1);
+    if (P == null) {
+        *err = GretlError.alloc;
+        return null;
+    }
+    S = strings_array_new(n);
+
+    for (t=t1, i=0; t<=t2; t++, i++) {
+        zht = zhat[t];
+        if (na(zht)) {
+            for (j=0; j<=ncut; j++) {
+                gretl_matrix_set(P, i, j, NADBL);
+            }
+        } else {
+            pij = lp_cdf(c[0] - zht, ci);
+            gretl_matrix_set(P, i, 0, pij);
+            for (j=1; j<ncut; j++) {
+                pij = lp_cdf(c[j] - zht, ci) - lp_cdf(c[j-1] - zht, ci);
+                gretl_matrix_set(P, i, j, pij);
+            }
+            pij = 1.0 - lp_cdf(c[ncut-1] - zht, pmod.ci);
+            gretl_matrix_set(P, i, ncut, pij);
+        }
+        if (S != null) {
+            S[i] = retrieve_date_string(t+1, dset, err);
+        }
+    }
+
+    gretl_matrix_set_t1(P, t1);
+    gretl_matrix_set_t2(P, t2);
+    if (S != null) {
+        gretl_matrix_set_rownames(P, S);
+    }
+
+    return P;
+}
+
+/**
+ * mn_logit_prediction:
+ * @Xt: vector of regressors at observation t.
+ * @b: array of coefficients.
+ * @yvals: vector of dependent variable values.
+  *
+ * Returns: the predicted value of the dependent variable, that
+ * is, the value for which the estimated probability is greatest.
+ */
+
+double mn_logit_prediction(const(GretlMatrixRaw) * Xt, const(double) * b, const(GretlMatrixRaw) * yvals)
+{
+    double * eXtb = null;
+    double St, pj, pmax;
+    int i, j, k, m, nx;
+    int pidx = 0;
+
+    nx = gretl_vector_get_length(Xt);
+    m = gretl_vector_get_length(yvals);
+
+    eXtb = cast(typeof(eXtb)) malloc(m * (*eXtb).sizeof);
+    if (eXtb == null) {
+        return NADBL;
+    }
+
+    /* base case */
+    eXtb[0] = St = 1.0;
+    k = 0;
+
+    /* loop across the other y-values */
+    for (j=1; j<m; j++) {
+        /* accumulate exp(X*beta) */
+        eXtb[j] = 0.0;
+        for (i=0; i<nx; i++) {
+            eXtb[j] += Xt.val[i] * b[k++];
+        }
+        eXtb[j] = exp(eXtb[j]);
+        St += eXtb[j];
+    }
+
+    pmax = 0.0;
+
+    for (j=0; j<m; j++) {
+        pj = eXtb[j] / St;
+        if (pj > pmax) {
+            pmax = pj;
+            pidx = j;
+        }
+    }
+
+    free(eXtb);
+
+    return yvals.val[pidx];
+}
+
+/* compute generalized residual for ordered models */
+
+double op_gen_resid(OpContainer * OC, const(double) * theta, int t)
+{
+    double ndxt, m0, m1, ystar0, f0, f1;
+    double ret, dP, ystar1 = 0.0;
+    int M = OC.ymax;
+    int nx = OC.nx;
+    int yt;
+
+    dP = OC.dP[t];
+    yt = OC.y[t];
+    ndxt = OC.ndx[t];
+
+    if (yt == 0) {
+        m0 = theta[nx];
+        ystar1 = ndxt + m0;
+    } else {
+        m0 = theta[nx + yt - 1];
+        ystar0 = ndxt + m0;
+        if (yt < M) {
+            m1 = theta[nx + yt];
+            ystar1 = ndxt + m1;
+        }
+    }
+
+    if (ystar1 < 6.0 || OC.ci == GretlCmdIndex.logit || 1) {
+        f0 = (yt == 0)? 0.0 : lp_pdf(ystar0, OC.ci) / dP;
+        f1 = (yt == M)? 0.0 : lp_pdf(ystar1, OC.ci) / dP;
+    } else {
+        /* L'Hôpital-based approximation */
+        f0 = (yt == 0)? 0.0 : -ystar0;
+        f1 = (yt == M)? 0.0 : -ystar1;
+    }
+
+    ret = (f0 - f1);
+
+    return ret;
+}
+
+/* Initialize the cut-points by counting the occurrences of each value
+   of the (normalized) dependent variable, finding the sample
+   proportion (cumulating as we go), and taking the inverse of the
+   normal CDF.
+*/
+
+void cut_points_init(OpContainer * OC, const(Model) * pmod, const(double) ** Z)
+{
+    const(double) * y = Z[pmod.list[1]];
+    double p = 0.0;
+    int i, j, t, nj;
+
+    for (i=OC.nx, j=0; i<OC.k; i++, j++) {
+        nj = 0;
+        for (t=pmod.t1; t<=pmod.t2; t++) {
+            if (!na(pmod.uhat[t]) && y[t] == j) {
+                nj++;
+            }
+        }
+        p += cast(double) nj / pmod.nobs;
+        OC.theta[i] = normal_cdf_inverse(p);
+    }
+}
+
+void add_pseudo_rsquared(Model * pmod, double L0, int k, int T, Gretlopt opt)
+{
+    if (opt & Gretlopt.OPT_S) {
+        /* Estrella pseudo-R^2 */
+        double expon = -2.0 * L0/T;
+
+        pmod.rsq = 1.0 - pow(pmod.lnL/L0, expon);
+        pmod.adjrsq = 1.0 - pow((pmod.lnL - k)/L0, expon);
+        pmod.opt |= Gretlopt.OPT_S;
+    } else {
+        /* McFadden pseudo-R^2 */
+        pmod.rsq = 1.0 - pmod.lnL/L0;
+        pmod.adjrsq = 1.0 - (pmod.lnL - k)/L0;
+    }
+}
+
+double binary_null_loglik(int * y, int T)
+{
+    double L0 = 0;
+    int ones = 0;
+    int zeros, t;
+
+    for (t=0; t<T; t++) {
+        ones += y[t];
+    }
+    zeros = T - ones;
+
+    L0 = ones * log(ones / cast(double) T);
+    L0 += zeros * log(zeros / cast(double) T);
+
+    return L0;
+}
+
+void op_LR_test(Model * pmod, OpContainer * OC, const(double) ** Z)
+{
+    int full_nx = OC.nx;
+    int restore = 1;
+    double L0;
+
+    if (OC.ymax == 1) {
+        restore = 0;
+        L0 = binary_null_loglik(OC.y, OC.nobs);
+    } else {
+        OC.k -= OC.nx;
+        OC.nx = 0;
+        cut_points_init(OC, pmod, Z);
+        L0 = op_loglik(OC.theta, OC);
+    }
+
+    if (!na(L0) && L0 <= pmod.lnL) {
+        pmod.chisq = 2.0 * (pmod.lnL - L0);
+        gretl_model_set_int(pmod, "lr_df", full_nx);
+        add_pseudo_rsquared(pmod, L0, full_nx, OC.nobs, OC.opt);
+    }
+
+    if (restore) {
+        /* restore original data on OC */
+        OC.nx = full_nx;
+        OC.k += OC.nx;
+    }
+}
+
+int oprobit_normtest(Model * pmod, OpContainer * OC)
+{
+    GretlMatrixRaw * ntX;
+    double * theta = OC.theta;
+    int k = OC.k;
+    int nx = OC.nx;
+    int t, s, yt;
+    double u, v, a2v, b2u;
+    double a = 0, b = 0;
+    double e3, e4;
+    int err = 0;
+
+    /* augmented version of G matrix */
+    ntX = gretl_matrix_reuse(OC.G, -1, k+2);
+
+    s = 0;
+    for (t=OC.pmod.t1; t<=OC.pmod.t2; t++) {
+        if (na(OC.pmod.uhat[t])) {
+            continue;
+        }
+        yt = OC.y[s];
+        if (yt == 0) {
+            b = OC.ndx[s] + theta[nx];
+            u = gretl_matrix_get(OC.G, s, nx);
+            b2u = b*b*u;
+            v = a2v = 0;
+        } else {
+            a = OC.ndx[s] + theta[nx + yt - 1];
+            v = - gretl_matrix_get(OC.G, s, nx + yt - 1);
+            a2v = a*a*v;
+            if (yt < OC.ymax) {
+                b = OC.ndx[s] + theta[nx + yt];
+                u = gretl_matrix_get(OC.G, s, nx + yt);
+                b2u = b*b*u;
+            } else {
+                u = b2u = 0;
+            }
+        }
+        e3 = 2*(v-u) + (a2v - b2u);
+        e4 = 3*(a*v-b*u) + (a*a2v - b*b2u);
+        gretl_matrix_set(ntX, s, k, e3);
+        gretl_matrix_set(ntX, s, k+1, e4);
+        s++;
+    }
+
+    /* dependent var should be all 1s */
+    for (t=0; t<OC.nobs; t++) {
+        OC.nty.val[t] = 1.0;
+    }
+
+    err = gretl_matrix_ols(OC.nty, ntX, OC.ntb, null, null, null);
+
+    if (!err) {
+        double X2 = OC.nobs;
+
+        gretl_matrix_multiply(ntX, OC.ntb, OC.nty);
+        for (t=0; t<OC.nobs; t++) {
+            u = 1 - OC.nty.val[t];
+            X2 -= u * u;
+        }
+        if (X2 > 0) {
+            if (OC.bootstrap) {
+                OC.replics += 1;
+                if (X2 > OC.X20) {
+                    OC.X2_ngt += 1;
+                }
+            } else {
+                ModelTest *test;
+
+                OC.X20 = X2;
+                gretl_model_add_normality_test(pmod, X2);
+                test = gretl_model_get_test(pmod, ModelTestType.normal);
+                if (test != null) {
+                    /* note asymptotic nature of test */
+                    model_test_set_opt(test, Gretlopt.OPT_A);
+                }
+            }
+        }
+    } else {
+        fprintf(stderr, "oprobit_normtest: err = %d\n".ptr, err);
+    }
+
+    /* return G to correct size for gradient */
+    gretl_matrix_reuse(OC.G, -1, k);
+
+    return err;
+}
+
+int fill_op_model(Model * pmod, const(int) * list, const(DatasetRaw) * dset, OpContainer * OC, int fncount, int grcount)
+{
+    GretlMatrixRaw * H = null;
+    int npar = OC.k;
+    int nx = OC.nx;
+    int correct = 0;
+    double xti, Xb;
+    int i, s, t, v, omp;
+    int err = 0;
+
+    H = ordered_hessian_inverse(OC, &err);
+    if (err) {
+        goto bailout;
+    }
+
+    if (OC.opt & Gretlopt.OPT_R) {
+        err = gretl_model_add_QML_vcv(pmod, OC.ci, H, OC.G,
+                                      dset, OC.opt, null);
+    } else {
+        err = gretl_model_add_hessian_vcv(pmod, H);
+    }
+
+    gretl_matrix_free(H);
+
+    if (err) {
+        goto bailout;
+    }
+
+    pmod.ci = OC.ci;
+    gretl_model_set_int(pmod, "ordered", 1);
+    gretl_model_set_int(pmod, "nx", OC.nx);
+    gretl_model_set_int(pmod, "ymin", OC.ymin);
+
+    /* blank out invalid statistics */
+    pmod.rsq = pmod.adjrsq = pmod.fstt = pmod.sigma = NADBL;
+    gretl_model_destroy_data_item(pmod, "centered-R2");
+    gretl_model_destroy_data_item(pmod, "uncentered");
+
+    if (grcount > 0) {
+        gretl_model_set_int(pmod, "fncount", fncount);
+        gretl_model_set_int(pmod, "grcount", grcount);
+    } else {
+        gretl_model_set_int(pmod, "iters", fncount);
+    }
+
+    free(pmod.xlist);
+    if (list[2] == 0) {
+    pmod.xlist = gretl_list_sublist(list, 3, -1);
+    } else {
+    pmod.xlist = gretl_list_sublist(list, 2, -1);
+    }
+
+    pmod.ncoeff = npar;
+    for (i=0; i<npar; i++) {
+        pmod.coeff[i] = OC.theta[i];
+    }
+
+    if (OC.ci == GretlCmdIndex.probit) {
+        oprobit_normtest(pmod, OC);
+    }
+
+    s = 0;
+    for (t=OC.t1; t<=OC.t2; t++) {
+        Xb = 0.0;
+        for (i=0; i<OC.nx; i++) {
+            v = OC.list[i+2];
+            xti = OC.Z[v][t];
+            if (na(xti)) {
+                Xb = NADBL;
+                break;
+            } else {
+                Xb += OC.theta[i] * xti;
+            }
+        }
+        /* yhat = X\hat{beta} */
+        pmod.yhat[t] = Xb;
+        if (na(Xb) || na(pmod.uhat[t])) {
+            continue;
+        }
+        omp = cast(int) ordered_model_prediction(pmod, Xb, 0);
+        if (omp == OC.y[s]) {
+            correct++;
+        }
+        /* compute generalized residual */
+        pmod.uhat[t] = op_gen_resid(OC, OC.theta, s);
+        s++;
+    }
+
+    gretl_model_set_int(pmod, "correct", correct);
+
+    pmod.lnL = op_loglik(OC.theta, OC);
+    mle_criteria(pmod, 0);
+    pmod.rsq = pmod.adjrsq = NADBL;
+
+    gretl_model_allocate_param_names(pmod, npar);
+
+    if (pmod.errcode == 0) {
+        char[16] tmp;
+
+        for (i=0; i<nx; i++) {
+            v = OC.list[i+2];
+            gretl_model_set_param_name(pmod, i, dset.varname[v]);
+        }
+        s = 1;
+        for (i=nx; i<npar; i++) {
+            sprintf(tmp.ptr, "cut%d".ptr, s++);
+            gretl_model_set_param_name(pmod, i, tmp.ptr);
+        }
+    }
+
+    /* trim the model list: remove references to the 'cut'
+       dummy variables */
+    for (i=pmod.list[0]; i>1; i--) {
+        if (!in_gretl_list(list, pmod.list[i])) {
+            gretl_list_delete_at_pos(pmod.list, i);
+        }
+    }
+
+    if (nx > 0) {
+        op_LR_test(pmod, OC, cast(const(double) **) dset.Z);
+        gretl_model_set_coeff_separator(pmod, null, nx);
+    }
+
+ bailout:
+
+    if (err && !pmod.errcode) {
+        pmod.errcode = err;
+    }
+
+    return pmod.errcode;
+}
+
+void record_bootstrap_pvalue(OpContainer * OC, Model * pmod)
+{
+    double pval = OC.X2_ngt / cast(double) OC.replics;
+    ModelTest *test;
+
+    test = gretl_model_get_test(pmod, ModelTestType.normal);
+    if (test != null) {
+        model_test_set_pvalue(test, pval);
+        model_test_set_opt(test, Gretlopt.OPT_B);
+    }
+}
+
+/* Prepare for a bootstrap iteration of the ordered probit
+   normality test: create artificial y. Note: we're using
+   pmod->coeff in creating y, thereby ensuring that we get
+   the coefficients from the original estimation, which
+   are saved onto @pmod before bootstrapping starts.
+*/
+
+void op_boot_prep(OpContainer * OC, const(Model) * pmod)
+{
+    double ystar;
+    double * cut = cast(double *) pmod.coeff + OC.nx;
+    int y, ncut = OC.k - OC.nx;
+    int i, v, t, s = 0;
+
+    for (t=OC.t1; t<=OC.t2; t++) {
+        if (na(OC.pmod.uhat[t])) {
+            continue;
+        }
+        ystar = gretl_one_snormal();
+        /* add regression effect */
+        for (i=0; i<OC.nx; i++) {
+            v = OC.list[i+2];
+            ystar += pmod.coeff[i] * OC.Z[v][t];
+        }
+        y = 0;
+        /* convert to observable using cut points */
+        for (i=0; i<ncut; i++) {
+            if (ystar > cut[i]) {
+                y++;
+            } else {
+                break;
+            }
+        }
+        OC.y[s++] = y;
+    }
+}
+
+void op_boot_init(OpContainer * OC, int * bs_maxit)
+{
+    int K, err = 0;
+
+    K = get_optval_int(GretlCmdIndex.probit, Gretlopt.OPT_B, &err);
+    if (!err && K > 0) {
+        *bs_maxit = K;
+    }
+    OC.bootstrap = 1;
+}
+
+/* Main ordered estimation function */
+
+int do_ordered(int ci, int ndum, int ymin, DatasetRaw * dset, Model * pmod, const(int) * list, Gretlopt opt, Prn * prn)
+{
+    int maxit = 1000;
+    int fncount = 0;
+    int grcount = 0;
+    OpContainer * OC;
+    int i, npar;
+    double * theta = null;
+    double toler;
+    int bs_iter = 0;
+    int bs_maxit = 1000;
+    int use_newton = 0;
+    Gretlopt maxopt;
+    int err;
+
+    OC = op_container_new(ci, ndum, ymin, dset.Z, pmod, opt);
+    if (OC == null) {
+        return GretlError.alloc;
+    }
+
+    npar = OC.k;
+    /* transformed theta to pass to optimizer */
+    theta = cast(typeof(theta)) malloc(npar * (*theta).sizeof);
+    if (theta == null) {
+        op_container_destroy(OC);
+        return GretlError.alloc;
+    }
+
+    if (libset_get_int(SetKey.gretl_optim) == OptimCode.newton) {
+        use_newton = 1;
+    }
+
+    /* initialize slopes */
+    for (i=0; i<OC.nx; i++) {
+        OC.theta[i] = 0.0001;
+    }
+
+    /* initialize cut points */
+    cut_points_init(OC, pmod, cast(const(double) **) dset.Z);
+
+    /* transform theta to log-diff form */
+    op_transform_theta(OC, theta);
+
+ reestimate:
+
+    if (OC.bootstrap) {
+        /* prepare for bootstrap iteration */
+        fncount = grcount = 0;
+        op_boot_prep(OC, pmod);
+        bs_iter++;
+    }
+
+    maxopt = (prn != null)? (Gretlopt.OPT_U | Gretlopt.OPT_V) : Gretlopt.OPT_U;
+
+    if (use_newton) {
+        double crittol = 1.0e-7;
+        double gradtol = 1.0e-7;
+
+        err = newton_raphson_max(theta, npar, maxit,
+                                 crittol, gradtol, &fncount,
+                                 CriterionType.loglik, &op_loglik,
+                                 &op_score, null, OC,
+                                 maxopt, prn);
+        fprintf(stderr, "use_newton: err = %d\n".ptr, err);
+    } else {
+        BFGS_defaults(&maxit, &toler, GretlCmdIndex.probit);
+        err = BFGS_max(theta, npar, maxit, toler,
+                       &fncount, &grcount, &op_loglik, CriterionType.loglik,
+                       &op_score, OC, null, maxopt, prn);
+    }
+
+    if (!err && !OC.bootstrap) {
+        /* transform back to 'real' theta and fill the model struct */
+        op_get_real_theta(OC, theta);
+        err = fill_op_model(pmod, list, dset, OC, fncount, grcount);
+    }
+
+    if ((err == GretlError.noconv || err == GretlError.nan) && bs_iter > 0) {
+        /* tolerate random numerical problems? */
+        err = 0;
+        bs_iter--;
+        goto reestimate;
+    }
+
+    if (!err && (opt & Gretlopt.OPT_B)) {
+        /* bootstrapping the ordered probit normality test */
+        if (bs_iter == 0) {
+            /* start the procedure */
+            op_boot_init(OC, &bs_maxit);
+        } else {
+            /* bootstrap in progress: run test */
+            oprobit_normtest(null, OC);
+        }
+        if (bs_iter == bs_maxit) {
+            record_bootstrap_pvalue(OC, pmod);
+        } else {
+            goto reestimate;
+        }
+    }
+
+    free(theta);
+    op_container_destroy(OC);
+
+    return err;
+}
+
+/* We want to ensure that the values of the dependent variable
+   actually used in the analysis (after dropping any bad
+   observations) form a zero-based series of consecutive
+   integers.
+*/
+
+int maybe_fix_op_depvar(Model * pmod, DatasetRaw * dset, double ** orig_y, int * ndum, int * ymin)
+{
+    GretlMatrixRaw * v = null;
+    double * yvals = null;
+    int dv = pmod.list[1];
+    int i, t, n = 0;
+    int fixit = 0;
+    int nv = 0;
+    int err = 0;
+
+    for (t=pmod.t1; t<=pmod.t2; t++) {
+        if (!na(pmod.uhat[t])) {
+            n++;
+        }
+    }
+
+    /* Transcribe the y values that were used in
+       the initial OLS
+    */
+
+    yvals = cast(typeof(yvals)) malloc(n * (*yvals).sizeof);
+    if (yvals == null) {
+        return GretlError.alloc;
+    }
+
+    i = 0;
+    for (t=pmod.t1; t<=pmod.t2; t++) {
+        if (!na(pmod.uhat[t])) {
+            yvals[i++] = dset.Z[dv][t];
+        }
+    }
+
+    /* Make a sorted vector containing the distinct
+       values of y
+    */
+    v = gretl_matrix_values(yvals, n, Gretlopt.OPT_S, &err);
+
+    if (!err) {
+        nv = gretl_vector_get_length(v);
+        *ndum = nv - 1;
+        if (v.val[0] != 0.0) {
+            /* the minimum y-value is not zero */
+            fixit = 1;
+        } else {
+            for (i=1; i<nv; i++) {
+                if (v.val[i] != v.val[i-1] + 1) {
+                    /* y values are not consecutive integers */
+                    fixit = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (fixit) {
+        double * normy = cast(double *) malloc(dset.n * (double).sizeof);
+
+        if (normy == null) {
+            err = GretlError.alloc;
+        } else {
+            for (t=0; t<dset.n; t++) {
+                normy[t] = NADBL;
+                if (!na(pmod.uhat[t])) {
+                    for (i=0; i<nv; i++) {
+                        if (dset.Z[dv][t] == v.val[i]) {
+                            normy[t] = i;
+                            break;
+                        }
+                    }
+                }
+            }
+            /* Back up the original y and replace it for
+               the duration of the ordered analysis.
+            */
+            *orig_y = dset.Z[dv];
+            dset.Z[dv] = normy;
+            *ymin = cast(int) v.val[0];
+        }
+    }
+
+    free(yvals);
+    gretl_matrix_free(v);
+
+    return err;
+}
+
+void restore_depvar(double ** Z, double * y, int v)
+{
+    free(Z[v]);
+    Z[v] = y;
+}
+
+int * make_dummies_list(const(int) * list, DatasetRaw * dset, int * err)
+{
+    int * dumlist = gretl_list_new(1);
+
+    if (dumlist == null) {
+        *err = GretlError.alloc;
+    } else {
+        dumlist[1] = list[1];
+
+        /* OPT_F -> drop first value */
+        *err = list_dumgenr(&dumlist, dset, Gretlopt.OPT_F);
+        if (*err) {
+            free(dumlist);
+            dumlist = null;
+        }
+    }
+
+    return dumlist;
+}
+
+/* make internal regression list for ordered model */
+
+int * make_op_list(const(int) * list, DatasetRaw * dset, int ** pdumlist, int * err)
+{
+    int * dumlist;
+    int * biglist;
+    int i, k, nv;
+
+    dumlist = make_dummies_list(list, dset, err);
+    if (dumlist == null) {
+        return null;
+    }
+
+    nv = list[0] + dumlist[0];
+
+    biglist = gretl_list_new(nv);
+    if (biglist == null) {
+        free(dumlist);
+        *err = GretlError.alloc;
+        return null;
+    }
+
+    k = 1;
+    for (i=1; i<=list[0]; i++) {
+        biglist[k++] = list[i];
+    }
+    for (i=1; i<=dumlist[0]; i++) {
+        biglist[k++] = dumlist[i];
+    }
+
+    *pdumlist = dumlist;
+
+    return biglist;
+}
+
+int list_purge_const(int * list, DatasetRaw * dset)
+{
+    Model tmpmod;
+    int depvar = list[1];
+    int i, j, n, ok = 0;
+    int err = 0;
+
+    /* first remove "const" (var 0) itself, if present */
+    for (i=2; i<=list[0]; i++) {
+        if (list[i] == 0) {
+            gretl_list_delete_at_pos(list, i);
+            break;
+        }
+    }
+
+    /* drop other stuff possibly collinear with the constant
+       (e.g. sets of dummies) */
+
+    list[1] = 0;     /* substitute the constant as dependent */
+    n = list[0] - 1; /* number of RHS terms */
+
+    for (j=0; j<n && !ok; j++) {
+        int vi, pos;
+
+        tmpmod = lsq(list, dset, GretlCmdIndex.ols, Gretlopt.OPT_A);
+        if (tmpmod.errcode) {
+            err = tmpmod.errcode;
+            break;
+        }
+        ok = (tmpmod.ess > 1.0e-6);
+        if (!ok) {
+            for (i=tmpmod.ncoeff-1; i>=0; i--) {
+                if (fabs(tmpmod.coeff[i]) > 1.0e-06) {
+                    /* tmpmod.list and list may not be identical */
+                    vi = tmpmod.list[i+2];
+                    pos = in_gretl_list(list, vi);
+                    if (pos >= 2) {
+                        gretl_list_delete_at_pos(list, pos);
+                    }
+                    break;
+                }
+            }
+        }
+        clear_model(&tmpmod);
+    }
+
+    /* reinstate the real dependent variable */
+    list[1] = depvar;
+
+    return err;
+}
+
+int ordered_depvar_check(int v, const(DatasetRaw) * dset)
+{
+    if (!series_is_discrete(dset, v) &&
+        !gretl_is_oprobit_ok(dset.t1, dset.t2, dset.Z[v])) {
+        gretl_errmsg_sprintf(_("The variable '%s' is not discrete").ptr,
+                             dset.varname[v]);
+        return GretlError.data;
+    }
+
+    return 0;
+}
+
+/* driver function for ordered logit/probit */
+
+Model ordered_estimate(int ci, const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    Model model;
+    Prn * vprn;
+    int orig_v = dset.v;
+    double * orig_y = null;
+    int * mylist = null;
+    int * biglist = null;
+    int * dumlist = null;
+    int ymin = 0;
+    int ndum = 0;
+
+    vprn = (opt & Gretlopt.OPT_V)? prn : null;
+
+    mylist = gretl_list_copy(list);
+    gretl_model_init(&model, dset);
+    model.errcode = ordered_depvar_check(mylist[1], dset);
+
+    if (!model.errcode) {
+        /* remove the constant from the incoming list, if present */
+        model.errcode = list_purge_const(mylist, dset);
+    }
+
+    if (!model.errcode) {
+        /* construct augmented regression list, including dummies
+           for the level of the dependent variable
+        */
+        biglist = make_op_list(mylist, dset, &dumlist, &model.errcode);
+    }
+
+    if (!model.errcode) {
+        /* run initial OLS, with dummies added */
+        model = lsq(biglist, dset, GretlCmdIndex.ols, Gretlopt.OPT_A);
+        if (model.errcode) {
+            fprintf(stderr, "ordered_estimate: initial OLS failed\n".ptr);
+        }
+    }
+
+    if (model.errcode) {
+        free(mylist);
+        free(dumlist);
+        free(biglist);
+        return model;
+    }
+
+    if (!model.errcode) {
+        /* after accounting for any missing observations, normalize
+           the dependent variable if necessary
+        */
+        model.errcode = maybe_fix_op_depvar(&model, dset, &orig_y,
+                                            &ndum, &ymin);
+    }
+
+    /* do the actual ordered probit analysis */
+    if (!model.errcode) {
+        clear_model_xpx(&model);
+        model.errcode = do_ordered(ci, ndum, ymin, dset, &model,
+                                   list, opt, vprn);
+    }
+
+    free(dumlist);
+    free(biglist);
+
+    if (orig_y != null) {
+        /* if we messed with the dependent var, put the original back */
+        restore_depvar(dset.Z, orig_y, mylist[1]);
+    }
+
+    if (dset.v > orig_v) {
+        /* clean up any automatically-added dummies */
+        dataset_drop_last_variables(dset, dset.v - orig_v);
+    }
+
+    set_model_id(&model, opt);
+    free(mylist);
+
+    return model;
+}
+
+double logit(double x)
+{
+    double l = 1.0 / (1.0 + exp(-x));
+
+    return l;
+}
+
+double logit_pdf(double x)
+{
+    double l, z = exp(-x);
+
+    l = z / ((1.0 + z) * (1.0 + z));
+
+    if (x < 0 && isnan(l)) {
+        l = 0;
+    }
+
+    return l;
+}
+
+/* Here we're checking for a dummy variable that acts as a
+   "one-way perfect predictor" of the binary dependent variable;
+   that is, an x such that Prob(y = y_a | x = x_b) = 1 for some
+   assignment of values 0 or 1 to y_a and x_b. The MLE does not
+   exist in the presence of such a regressor, so we'll remove
+   it from the model (and alert the user).
+
+   The approach taken by Stata is not only to drop such a
+   regressor but also to drop the observations that are thus
+   perfectly predicted. As the outcome of discussions in
+   November-December 2014 we decided not to follow Stata in
+   this policy: we just drop the regressor. However, in case
+   we want to revisit this point I'm leaving in place the
+   apparatus required to implement the Stata policy.
+
+   AC, 2014-12-04
+*/
+
+char * classifier_check(int * list, const(DatasetRaw) * dset, Prn * prn, int * ndropped, int * err)
+{
+    char * mask = null;
+    int yno = list[1];
+    const(double) * y = dset.Z[yno];
+    int i, v, ni, t;
+
+    *ndropped = 0;
+
+    for (i=list[0]; i>=2; i--) {
+        int getout = 0;
+
+        v = list[i];
+        if (v == 0) {
+            continue;
+        }
+
+        ni = gretl_isdummy(dset.t1, dset.t2, dset.Z[v]);
+
+        if (ni > 0) {
+            const(double) * x = dset.Z[v];
+            int[4] xytab = 0;
+            int pp0 = 1, pp1 = 1;
+            int maskval = -1;
+
+            for (t=dset.t1; t<=dset.t2; t++) {
+                xytab[0] += (x[t] == 0 && y[t] == 0);
+                xytab[1] += (x[t] == 0 && y[t] == 1);
+                xytab[2] += (x[t] == 1 && y[t] == 0);
+                xytab[3] += (x[t] == 1 && y[t] == 1);
+                if (xytab[1] && xytab[3]) {
+                    /* x does not perfectly predict y == 0 */
+                    pp0 = 0;
+                }
+                if (xytab[0] && xytab[2]) {
+                    /* x does not perfectly predict y == 1 */
+                    pp1 = 0;
+                }
+                if (!pp0 && !pp1) {
+                    break;
+                }
+            }
+
+            if (pp0 && pp1) {
+                pputc(prn, '\n');
+                pprintf(prn, _("Note: %s = %s%s at all observations\n").ptr,
+                        dset.varname[yno], xytab[0] ? "".ptr : "!".ptr,
+                        dset.varname[v]);
+                *err = GretlError.noconv;
+                getout = 1;
+            } else if (pp0) {
+                maskval = xytab[1] ? 1 : 0;
+                pputc(prn, '\n');
+                pprintf(prn, _("Note: Prob(%s = %d | %s = %d) = 1\n").ptr,
+                        dset.varname[yno], 0, dset.varname[v],
+                        maskval);
+            } else if (pp1) {
+                maskval = xytab[0] ? 1 : 0;
+                pputc(prn, '\n');
+                pprintf(prn, _("Note: Prob(%s = %d | %s = %d) = 1\n").ptr,
+                        dset.varname[yno], 1, dset.varname[v],
+                        maskval);
+            }
+
+            if (maskval >= 0) {
+                pprintf(prn, _("Dropping %s\n").ptr, dset.varname[v]);
+                gretl_list_delete_at_pos(list, i);
+            }
+        }
+        if (getout) {
+            break;
+        }
+    }
+
+    return mask;
+}
+
+/* struct for holding multinomial logit info */
+
+struct MnlInfo {
+    int n; /* number of categories (excluding base) */
+    int k; /* number of coeffs per category */
+    int npar; /* total number of parameters */
+    int T; /* number of observations */
+    double * theta; /* coeffs for Newton/BFGS */
+    GretlMatrixBlock * B;
+    GretlMatrixRaw * y; /* dependent variable */
+    GretlMatrixRaw * X; /* regressors */
+    GretlMatrixRaw * b; /* coefficients, matrix form */
+    GretlMatrixRaw * Xb; /* coeffs times regressors */
+    GretlMatrixRaw * P; /* probabilities */
+}
+
+void mnl_info_destroy(MnlInfo * mnl)
+{
+    if (mnl != null) {
+        gretl_matrix_block_destroy(mnl.B);
+        free(mnl.theta);
+        free(mnl);
+    }
+}
+
+MnlInfo * mnl_info_new(int n, int k, int T)
+{
+    MnlInfo * mnl = cast(MnlInfo *) malloc((MnlInfo).sizeof);
+    int i;
+
+    if (mnl != null) {
+        mnl.n = n;
+        mnl.k = k;
+        mnl.T = T;
+        mnl.npar = k * n;
+        mnl.theta = cast(typeof(mnl.theta)) malloc(mnl.npar * (*mnl.theta).sizeof);
+        if (mnl.theta == null) {
+            free(mnl);
+            return null;
+        }
+        mnl.B = gretl_matrix_block_new(&mnl.y, T, 1,
+                                        &mnl.X, T, k,
+                                        &mnl.b, k, n,
+                                        &mnl.Xb, T, n,
+                                        &mnl.P, T, n,
+                                        null);
+        if (mnl.B == null) {
+            free(mnl.theta);
+            free(mnl);
+            mnl = null;
+        } else {
+            for (i=0; i<mnl.npar; i++) {
+                mnl.theta[i] = 0.0;
+            }
+        }
+    }
+
+    return mnl;
+}
+
+/* compute loglikelihood for multinomial logit */
+
+extern (C) double mn_logit_loglik(const(double) * theta, void * ptr)
+{
+    MnlInfo * mnl = cast(MnlInfo *) ptr;
+    double x, xti, exti, ll = 0.0;
+    int yt, i, t;
+
+    for (i=0; i<mnl.npar; i++) {
+        mnl.b.val[i] = theta[i];
+    }
+
+    gretl_matrix_multiply(mnl.X, mnl.b, mnl.Xb);
+
+    for (t=0; t<mnl.T; t++) {
+        x = 1.0;
+        for (i=0; i<mnl.n; i++) {
+            /* sum row i of exp(Xb) */
+            xti = gretl_matrix_get(mnl.Xb, t, i);
+            exti = exp(xti);
+            x += exti;
+        }
+        ll -= log(x);
+        yt = cast(int) gretl_vector_get(mnl.y, t);
+        if (yt > 0) {
+            ll += gretl_matrix_get(mnl.Xb, t, yt-1);
+        }
+    }
+
+    return ll;
+}
+
+extern (C) int mn_logit_score(double * theta, double * s, int npar, BFGS_CRIT_FUNC ll, void * ptr)
+{
+    MnlInfo * mnl = cast(MnlInfo *) ptr;
+    double x, xti, exti, pti, p, g;
+    int i, j, k, t, yt;
+    int err = 0;
+
+    for (i=0; i<npar; i++) {
+        s[i] = 0.0;
+    }
+
+    for (t=0; t<mnl.T && !errno; t++) {
+        x = 1.0;
+        for (i=0; i<mnl.n; i++) {
+            /* sum row i of exp(Xb) */
+            xti = gretl_matrix_get(mnl.Xb, t, i);
+            exti = exp(xti);
+            x += exti;
+            gretl_matrix_set(mnl.P, t, i, exti);
+        }
+        yt = cast(int) gretl_vector_get(mnl.y, t);
+        k = 0;
+        for (i=0; i<mnl.n; i++) {
+            pti = gretl_matrix_get(mnl.P, t, i) / x;
+            gretl_matrix_set(mnl.P, t, i, pti);
+            p = (i == (yt-1)) - pti;
+            for (j=0; j<mnl.k; j++) {
+                g = p * gretl_matrix_get(mnl.X, t, j);
+                s[k++] += g;
+            }
+        }
+    }
+
+    return err;
+}
+
+/* multinomial logit: form the negative of the analytical
+   Hessian */
+
+extern (C) int mnl_hessian(double * theta, GretlMatrixRaw * H, void * data)
+{
+    MnlInfo * mnl = cast(MnlInfo *) data;
+    GretlMatrixBlock * B;
+    GretlMatrixRaw * x;
+    GretlMatrixRaw * xx;
+    GretlMatrixRaw * hjk;
+    double xti, ptj, ptk;
+    int r, c;
+    int i, j, k, t;
+
+    B = gretl_matrix_block_new(&x, 1, mnl.k,
+                               &xx, mnl.k, mnl.k,
+                               &hjk, mnl.k, mnl.k,
+                               null);
+    if (B == null) {
+        return GretlError.alloc;
+    }
+
+    r = c = 0;
+
+    for (j=0; j<mnl.n; j++) {
+        for (k=0; k<=j; k++) {
+            gretl_matrix_zero(hjk);
+            for (t=0; t<mnl.T; t++) {
+                for (i=0; i<mnl.k; i++) {
+                    xti = gretl_matrix_get(mnl.X, t, i);
+                    gretl_vector_set(x, i, xti);
+                }
+                gretl_matrix_multiply_mod(x, GretlMatrixMod.transpose,
+                                          x, GretlMatrixMod.none,
+                                          xx, GretlMatrixMod.none);
+                ptj = gretl_matrix_get(mnl.P, t, j);
+                ptk = gretl_matrix_get(mnl.P, t, k);
+                gretl_matrix_multiply_by_scalar(xx, ptj * ((j == k) - ptk));
+                gretl_matrix_add_to(hjk, xx);
+            }
+            gretl_matrix_inscribe_matrix(H, hjk, r, c, GretlMatrixMod.none);
+            if (j != k) {
+                gretl_matrix_inscribe_matrix(H, hjk, c, r, GretlMatrixMod.none);
+            }
+            c += mnl.k;
+        }
+        r += mnl.k;
+        c = 0;
+    }
+
+    gretl_matrix_block_destroy(B);
+
+    return 0;
+}
+
+GretlMatrixRaw * mnl_hessian_inverse(MnlInfo * mnl, int * err)
+{
+    GretlMatrixRaw * H;
+
+    H = gretl_zero_matrix_new(mnl.npar, mnl.npar);
+    if (H == null) {
+        *err = GretlError.alloc;
+    } else {
+        *err = mnl_hessian(mnl.theta, H, mnl);
+    }
+
+    if (!*err) {
+        *err = gretl_invert_symmetric_matrix(H);
+    }
+
+    return H;
+}
+
+GretlMatrixRaw * mnl_score_matrix(MnlInfo * mnl, int * err)
+{
+    GretlMatrixRaw * G;
+    double p, g;
+    int yt, i, j, k, t;
+
+    G = gretl_matrix_alloc(mnl.T, mnl.npar);
+    if (G == null) {
+        *err = GretlError.alloc;
+        return null;
+    }
+
+    for (t=0; t<mnl.T; t++) {
+        yt = cast(int) gretl_vector_get(mnl.y, t);
+        k = 0;
+        for (i=0; i<mnl.n; i++) {
+            p = (i == (yt-1)) - gretl_matrix_get(mnl.P, t, i);
+            for (j=0; j<mnl.k; j++) {
+                g = p * gretl_matrix_get(mnl.X, t, j);
+                gretl_matrix_set(G, t, k++, g);
+            }
+        }
+    }
+
+    return G;
+}
+
+int mnl_add_variance_matrix(Model * pmod, MnlInfo * mnl, const(DatasetRaw) * dset, Gretlopt opt)
+{
+    GretlMatrixRaw * H = null;
+    GretlMatrixRaw * G = null;
+    int err = 0;
+
+    H = mnl_hessian_inverse(mnl, &err);
+    if (err) {
+        return err;
+    }
+
+    if (opt & Gretlopt.OPT_R) {
+        G = mnl_score_matrix(mnl, &err);
+    }
+
+    if (!err) {
+        if (opt & Gretlopt.OPT_R) {
+            err = gretl_model_add_QML_vcv(pmod, GretlCmdIndex.logit, H, G,
+                                          dset, opt, null);
+        } else {
+            err = gretl_model_add_hessian_vcv(pmod, H);
+        }
+    }
+
+    gretl_matrix_free(H);
+    gretl_matrix_free(G);
+
+    return err;
+}
+
+/* Construct 'yhat' and 'uhat'.  Maybe this is too simple-minded; we
+   just find, for each observation, the y-value for which the
+   probability is maximized and set that as yhat[t].  We then set
+   uhat[t] as a binary "hit" (residual = 0) or "miss" (residual = 1).
+   Constructing a "quantitative" residual as y[t] - yhat[t] seems
+   spurious, since there's no meaningful metric for the "distance"
+   between y and yhat when y is an unordered response.
+
+   Note: @yvals is non-NULL if and only if we had to transform the
+   dependent variable, because it did not form a 0-based sequence of
+   consecutive integers.
+*/
+
+void mn_logit_yhat(Model * pmod, MnlInfo * mnl, const(int) * yvals)
+{
+    double p, pmax;
+    int i, s, t, yidx;
+    int ncorrect = 0;
+
+    s = 0;
+    for (t=pmod.t1; t<=pmod.t2; t++) {
+        if (na(pmod.yhat[t])) {
+            continue;
+        }
+        pmax = 0.0;
+        yidx = 0;
+        for (i=0; i<mnl.n; i++) {
+            p = gretl_matrix_get(mnl.Xb, s, i);
+            if (p > pmax) {
+                pmax = p;
+                yidx = i + 1;
+            }
+        }
+        if (yidx == cast(int) mnl.y.val[s]) {
+            ncorrect++;
+            pmod.uhat[t] = 0;
+        } else {
+            pmod.uhat[t] = 1;
+        }
+        if (yvals != null) {
+            pmod.yhat[t] = yvals[yidx];
+        } else {
+            pmod.yhat[t] = yidx;
+        }
+        s++;
+    }
+
+    gretl_model_set_int(pmod, "correct", ncorrect);
+}
+
+/**
+ * mn_logit_probabilities:
+ * @pmod: pointer to multinomial logit model
+ * @dset: dataset struct.
+ * @err: location to receive error code.
+ *
+ * Computes the estimated probabilities of the outcomes
+ * for a multinomial logit model. The returned matrix
+ * is n x m, where n is the number of observations in
+ * the sample range over which the model was estimated
+ * and m is the number of distinct outcomes. Each element
+ * represents the conditional probability of outcome j
+ * given the values of the regressors at observation i.
+ *
+ * If any of the regressor values are missing at a given
+ * observation the probability is set to NaN; provided the
+ * regressor information is complete we compute the
+ * outcome probabilities even if the actual outcome is
+ * missing.
+ *
+ * Returns: allocated matrix or NULL on failure.
+ */
+
+GretlMatrixRaw * mn_logit_probabilities(const(Model) * pmod, int t1, int t2, const(DatasetRaw) * dset, int * err)
+{
+    GretlMatrixRaw * P = null;
+    const(GretlMatrixRaw) * yvals = null;
+    const(double) * b = null;
+    double * eXbt = null;
+    double St, ptj;
+    char ** S = null;
+    int j, k, s, t, vi, ok;
+    int i, m = 0;
+
+    if (pmod == null || pmod.list == null || pmod.coeff == null) {
+        *err = GretlError.data;
+        return null;
+    }
+
+    /* list of outcome values (including the base case) */
+    yvals = cast(typeof(yvals)) gretl_model_get_data(pmod, "yvals");
+    if (yvals == null) {
+        *err = GretlError.data;
+    } else {
+        m = gretl_vector_get_length(yvals);
+    }
+
+    if (!*err) {
+        for (i=1; i<=pmod.list[0]; i++) {
+            if (pmod.list[i] >= dset.v) {
+                /* a regressor has disappeared */
+                *err = GretlError.data;
+                break;
+            }
+        }
+    }
+
+    if (!*err) {
+        int n = t2 - t1 + 1;
+
+        P = gretl_matrix_alloc(n, m);
+        if (P == null) {
+            *err = GretlError.alloc;
+        } else {
+            S = strings_array_new(n);
+        }
+    }
+
+    if (!*err) {
+        /* allocate required workspace */
+        eXbt = cast(typeof(eXbt)) malloc(m * (*eXbt).sizeof);
+        if (eXbt == null) {
+            *err = GretlError.alloc;
+        }
+    }
+
+    if (*err) {
+        goto bailout;
+    }
+
+    b = pmod.coeff;
+
+    for (t=t1, s=0; t<=t2; t++, s++) {
+        ok = 1;
+        for (i=2; i<=pmod.list[0]; i++) {
+            vi = pmod.list[i];
+            if (na(dset.Z[vi][t])) {
+                ok = 0;
+                break;
+            }
+        }
+        if (!ok) {
+            /* one or more regressors missing */
+            for (j=0; j<m; j++) {
+                gretl_matrix_set(P, s, j, NADBL);
+            }
+        } else {
+            /* base case */
+            eXbt[0] = St = 1.0;
+            k = 0;
+            /* loop across the other y-values */
+            for (j=1; j<m; j++) {
+                /* accumulate exp(X*beta) */
+                eXbt[j] = 0.0;
+                for (i=2; i<=pmod.list[0]; i++) {
+                    vi = pmod.list[i];
+                    eXbt[j] += dset.Z[vi][t] * b[k++];
+                }
+                eXbt[j] = exp(eXbt[j]);
+                St += eXbt[j];
+            }
+            for (j=0; j<m; j++) {
+                ptj = eXbt[j] / St;
+                gretl_matrix_set(P, s, j, ptj);
+            }
+        }
+        if (S != null) {
+            S[s] = retrieve_date_string(t+1, dset, err);
+        }
+    }
+
+    if (P != null) {
+        gretl_matrix_set_t1(P, t1);
+        gretl_matrix_set_t2(P, t2);
+        if (S != null) {
+            gretl_matrix_set_rownames(P, S);
+        }
+    }
+
+ bailout:
+
+    free(eXbt);
+
+    return P;
+}
+
+/**
+ * binary_logit_odds_ratios:
+ * @pmod: pointer to binary logit model
+ * @dset: dataset struct.
+ *
+ * Computes odds ratios, their standard errors, and 95 percent
+ * confidence intervals for a binary logit model. Attaches to
+ * @pmod a labeled matrix representation of the results.
+ *
+ * Returns: 0 on success, error code on error.
+ */
+
+int binary_logit_odds_ratios(Model * pmod, const(DatasetRaw) * dset)
+{
+    CoeffIntervals *cf;
+    GretlMatrixRaw * m;
+    int err = 0;
+
+    cf = gretl_model_get_coeff_intervals(pmod, dset, Gretlopt.OPT_O | Gretlopt.OPT_E);
+    if (cf != null) {
+        m = conf_intervals_matrix(cf);
+        err = gretl_model_set_matrix_as_data(pmod, "oddsratios", m);
+        free_coeff_intervals(cf);
+    }
+
+    return err;
+}
+
+/* In case the dependent variable is not in canonical form for
+   multinomial logit, construct a transformed version */
+
+int make_canonical_depvar(Model * pmod, const(double) * y, GretlMatrixRaw * yvec)
+{
+    Sorter * s;
+    double nexty, bady;
+    int i, t, n = pmod.nobs;
+
+    s = cast(typeof(s)) malloc(n * (*s).sizeof);
+    if (s == null) {
+        return GretlError.alloc;
+    }
+
+    i = 0;
+    for (t=pmod.t1; t<=pmod.t2; t++) {
+        if (!na(pmod.uhat[t])) {
+            s[i].x = y[t];
+            s[i].t = i;
+            i++;
+        }
+    }
+
+    qsort(s, n, (*s).sizeof, &gretl_compare_doubles);
+
+    /* normalize to a minimum of zero */
+    if (s[0].x != 0) {
+        double ymin = s[0].x;
+
+        for (i=0; i<n && s[i].x == ymin; i++) {
+            s[i].x = 0.0;
+        }
+    }
+
+    /* ensure that the sorted values increase by steps of one */
+    for (i=1; i<n; i++) {
+        if (s[i].x != s[i-1].x) {
+            nexty = s[i-1].x + 1;
+            if (s[i].x != nexty) {
+                bady = s[i].x;
+                while (i < n && s[i].x == bady) {
+                    s[i++].x = nexty;
+                }
+                i--; /* compensate for outer i++ */
+            }
+        }
+    }
+
+    /* write canonical version of y into yvec */
+    for (i=0; i<n; i++) {
+        yvec.val[s[i].t] = s[i].x;
+    }
+
+    free(s);
+
+    return 0;
+}
+
+/* multinomial logit: count the distinct values taken on by the
+   dependent variable.  If the variable does not take the form of a
+   sequence of consecutive integers with a base of zero, flag this
+   by returning via @yvals the vector of distinct values. To assist
+   with later computations, we also return a frequency count for
+   the distinct y values in @valcount.
+*/
+
+int mn_value_count(const(double) * y, Model * pmod, int ** valcount, int ** yvals)
+{
+    double * sy;
+    int * vc = null;
+    int * v = null;
+    int want_yvals = 0;
+    int s, t, n;
+
+    sy = cast(typeof(sy)) malloc(pmod.nobs * (*sy).sizeof);
+    if (sy == null) {
+        pmod.errcode = GretlError.alloc;
+        return 0;
+    }
+
+    s = 0;
+    for (t=pmod.t1; t<=pmod.t2; t++) {
+        if (!na(pmod.uhat[t])) {
+            sy[s++] = y[t];
+        }
+    }
+
+    qsort(sy, pmod.nobs, (*sy).sizeof, &gretl_compare_doubles);
+
+    n = count_distinct_values(sy, pmod.nobs);
+
+    vc = cast(typeof(vc)) malloc(n * (*vc).sizeof);
+    v = cast(typeof(v)) malloc(n * (*v).sizeof);
+
+    if (vc == null || v == null) {
+        pmod.errcode = GretlError.alloc;
+        free(sy);
+        free(vc);
+        return 0;
+    }
+
+    for (s=0; s<n; s++) {
+        vc[s] = 0;
+    }
+
+    if (sy[0] != 0.0) {
+        /* we'll need v later */
+        want_yvals = 1;
+    }
+
+    v[0] = cast(int) sy[0];
+    s = 0;
+
+    for (t=0; t<pmod.nobs && !pmod.errcode; t++) {
+        if (sy[t] != floor(sy[t])) {
+            pmod.errcode = GretlError.data;
+            gretl_errmsg_set(_("logit: the dependent variable must form a sequence of integers").ptr);
+        } else if (t > 0 && sy[t] != sy[t-1]) {
+            v[++s] = cast(int) sy[t];
+            if (sy[t] != sy[t-1] + 1) {
+                /* not consecutive: need v later */
+                want_yvals = 1;
+            }
+            vc[s] = 1;
+        } else {
+            vc[s] += 1;
+        }
+    }
+
+    if (pmod.errcode) {
+        free(vc);
+        n = 0;
+    } else {
+        *valcount = vc;
+        if (want_yvals) {
+            *yvals = v;
+            v = null;
+        }
+    }
+
+    free(v);
+    free(sy);
+
+    return n;
+}
+
+/* Transcribe multinomial logit results into @pmod, which was
+   initialized via OLS, and add covariance matrix.
+*/
+
+void mnl_finish(MnlInfo * mnl, Model * pmod, const(int) * valcount, const(int) * yvals, const(DatasetRaw) * dset, Gretlopt opt)
+{
+    int i;
+
+    pmod.errcode = gretl_model_write_coeffs(pmod, mnl.theta, mnl.npar);
+
+    if (!pmod.errcode) {
+        pmod.errcode = mnl_add_variance_matrix(pmod, mnl, dset, opt);
+    }
+
+    if (!pmod.errcode) {
+        pmod.ci = GretlCmdIndex.logit;
+        pmod.lnL = mn_logit_loglik(mnl.theta, mnl);
+        mle_criteria(pmod, 0);
+
+        gretl_model_set_int(pmod, "multinom", mnl.n);
+        gretl_model_set_int(pmod, "cblock", mnl.k);
+
+        pmod.ess = pmod.sigma = NADBL;
+        pmod.fstt = pmod.rsq = pmod.adjrsq = NADBL;
+
+        gretl_model_allocate_param_names(pmod, mnl.npar);
+    }
+
+    if (!pmod.errcode) {
+        int j, vj, k = 0;
+
+        for (i=0; i<mnl.n; i++) {
+            for (j=0; j<mnl.k; j++) {
+                vj = pmod.list[j+2];
+                gretl_model_set_param_name(pmod, k++, dset.varname[vj]);
+            }
+        }
+        mn_logit_yhat(pmod, mnl, yvals);
+        set_model_id(pmod, opt);
+    }
+
+    if (!pmod.errcode) {
+        /* add a record of the values of the dependent variable */
+        GretlMatrixRaw * yv = gretl_column_vector_alloc(mnl.n + 1);
+
+        if (yv != null) {
+            for (i=0; i<=mnl.n; i++) {
+                if (yvals != null) {
+                    yv.val[i] = yvals[i];
+                } else {
+                    yv.val[i] = i;
+                }
+            }
+            gretl_model_set_matrix_as_data(pmod, "yvals", yv);
+        }
+    }
+
+    if (!pmod.errcode) {
+        /* add overall likelihood ratio test */
+        int ni, df = pmod.ncoeff;
+        double L0 = 0.0;
+
+        if (pmod.ifc) {
+            df -= mnl.n;
+        }
+        for (i=0; i<=mnl.n; i++) {
+            ni = valcount[i];
+            if (pmod.ifc) {
+                L0 += ni * log(cast(double) ni / mnl.T);
+            } else {
+                L0 += ni * log(1.0 / (mnl.n + 1));
+            }
+        }
+        pmod.chisq = 2.0 * (pmod.lnL - L0);
+        pmod.dfn = df;
+    }
+
+    clear_model_xpx(pmod);
+
+    pmod.opt |= Gretlopt.OPT_M;
+}
+
+/* multinomial logit */
+
+Model mnl_model(const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    int maxit = 1000;
+    int fncount = 0;
+    int grcount = 0;
+    Model mod;
+    MnlInfo * mnl;
+    int * valcount = null;
+    int * yvals = null;
+    int n, k = list[0] - 1;
+    Gretlopt maxopt;
+    int use_bfgs = 0;
+    int i, vi, t, s;
+
+    /* we'll start with OLS to flush out data issues */
+    mod = lsq(list, dset, GretlCmdIndex.ols, Gretlopt.OPT_A);
+    if (mod.errcode) {
+        return mod;
+    }
+
+    n = mn_value_count(dset.Z[list[1]], &mod, &valcount, &yvals);
+    if (mod.errcode) {
+        return mod;
+    }
+
+    if (opt & Gretlopt.OPT_C) {
+        /* cluster implies robust */
+        opt |= Gretlopt.OPT_R;
+    }
+
+    n--; /* exclude the first value */
+
+    if (n * k > mod.nobs) {
+        mod.errcode = GretlError.df;
+        return mod;
+    }
+
+    mnl = mnl_info_new(n, k, mod.nobs);
+    if (mnl == null) {
+        mod.errcode = GretlError.alloc;
+        return mod;
+    }
+
+    if (yvals != null) {
+        /* the dependent variable needs transforming */
+        mod.errcode = make_canonical_depvar(&mod, dset.Z[list[1]], mnl.y);
+        if (mod.errcode) {
+            goto bailout;
+        }
+    } else {
+        s = 0;
+        for (t=mod.t1; t<=mod.t2; t++) {
+            if (!na(mod.yhat[t])) {
+                mnl.y.val[s++] = dset.Z[list[1]][t];
+            }
+        }
+    }
+
+    for (i=0; i<k; i++) {
+        vi = list[i+2];
+        s = 0;
+        for (t=mod.t1; t<=mod.t2; t++) {
+            if (!na(mod.yhat[t])) {
+                gretl_matrix_set(mnl.X, s++, i, dset.Z[vi][t]);
+            }
+        }
+    }
+
+    if (mod.ifc) {
+        double lf0 = log(valcount[0]);
+        int j = 0;
+
+        for (i=1; i<=mnl.n; i++) {
+            mnl.theta[j] = log(valcount[i]) - lf0;
+            j += mnl.k;
+        }
+    }
+
+    if (libset_get_int(SetKey.gretl_optim) == OptimCode.bfgs) {
+        use_bfgs = 1;
+    }
+
+    maxopt = (prn != null)? (Gretlopt.OPT_U | Gretlopt.OPT_V) : Gretlopt.OPT_U;
+
+    if (use_bfgs) {
+        mod.errcode = BFGS_max(mnl.theta, mnl.npar, maxit, 0.0,
+                               &fncount, &grcount, &mn_logit_loglik, CriterionType.loglik,
+                               &mn_logit_score, mnl, null, maxopt, prn);
+    } else {
+        double crittol = 1.0e-8;
+        double gradtol = 1.0e-7;
+
+        maxit = 100;
+        mod.errcode = newton_raphson_max(mnl.theta, mnl.npar, maxit,
+                                         crittol, gradtol, &fncount,
+                                         CriterionType.loglik, &mn_logit_loglik,
+                                         &mn_logit_score, &mnl_hessian, mnl,
+                                         maxopt, prn);
+    }
+
+    if (!mod.errcode) {
+        mnl_finish(mnl, &mod, valcount, yvals, dset, opt);
+    }
+
+ bailout:
+
+    mnl_info_destroy(mnl);
+    free(valcount);
+    free(yvals);
+
+    return mod;
+}
+
+/**
+ * biprobit_model:
+ * @list: binary dependent variable 1, binary dependent variable 2,
+ * list of regressors for y1. If @list ends here, it is assumed that the
+ * explanatory variables for y2 are the same as y1. Otherwise, the list
+ * must include a separator and the list of regressors for y2.
+ * @dset: dataset struct.
+ * @opt: can contain OPT_Q for quiet operation, OPT_V for verbose
+ * operation, OPT_R for robust covariance matrix, OPT_G for covariance
+ * matrix based on Outer Product of Gradient.
+ * @prn: printing struct.
+ *
+ * Computes estimates of the bivariate probit model specified by @list,
+ * using maximum likelihood via Newton-Raphson.
+ *
+ * Returns: a #MODEL struct, containing the estimates.
+ */
+
+Model biprobit_model(const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    Model bpmod;
+    alias BiprobitEstimateFn = extern (C) Model function(const(int) *, DatasetRaw *, Gretlopt, Prn *);
+    BiprobitEstimateFn biprobit_estimate;
+
+    gretl_error_clear();
+
+    biprobit_estimate = cast(BiprobitEstimateFn) get_plugin_function("biprobit_estimate");
+
+    if (biprobit_estimate == null) {
+        gretl_model_init(&bpmod, dset);
+        bpmod.errcode = GretlError.fopen;
+        return bpmod;
+    }
+
+    bpmod = biprobit_estimate(list, dset, opt, prn);
+    set_model_id(&bpmod, opt);
+
+    return bpmod;
+}
+
+/* struct for holding binary probit/logit info */
+
+struct BinInfo {
+    int ci; /* PROBIT or LOGIT */
+    int k; /* number of parameters */
+    int T; /* number of observations */
+    int pp_err; /* to record perfect-prediction error */
+    double * theta; /* coeffs for Newton-Raphson */
+    int * y; /* dependent variable */
+    GretlMatrixRaw * X; /* regressors */
+    GretlMatrixRaw * Ri; /* inverse of R from decomp of X */
+    GretlMatrixBlock * B;
+    GretlMatrixRaw * pX; /* for use with Hessian */
+    GretlMatrixRaw * Xb; /* index function values */
+}
+
+void bin_info_destroy(BinInfo * bin)
+{
+    if (bin != null) {
+        gretl_matrix_block_destroy(bin.B);
+        gretl_matrix_free(bin.X);
+        gretl_matrix_free(bin.Ri);
+        free(bin.theta);
+        free(bin.y);
+        free(bin);
+    }
+}
+
+BinInfo * bin_info_new(int ci, int k, int T)
+{
+    BinInfo * bin = cast(BinInfo *) malloc((BinInfo).sizeof);
+    int err = 0;
+
+    if (bin == null) {
+        return null;
+    }
+
+    bin.X = null;
+    bin.Ri = null;
+    bin.B = null;
+    bin.ci = ci;
+    bin.k = k;
+    bin.T = T;
+    bin.pp_err = 0;
+    bin.theta = cast(typeof(bin.theta)) malloc(k * (*bin.theta).sizeof);
+    bin.y = cast(typeof(bin.y)) malloc(T * (*bin.y).sizeof);
+    if (bin.theta == null || bin.y == null) {
+        err = GretlError.alloc;
+    } else {
+        bin.B = gretl_matrix_block_new(&bin.pX, T, k,
+                                        &bin.Xb, T, 1,
+                                        null);
+        if (bin.B == null) {
+            err = GretlError.alloc;
+        }
+    }
+    if (err) {
+        bin_info_destroy(bin);
+        bin = null;
+    }
+
+    return bin;
+}
+
+/* compute loglikelihood for binary probit/logit */
+
+extern (C) double binary_loglik(const(double) * theta, void * ptr)
+{
+    BinInfo * bin = cast(BinInfo *) ptr;
+    GretlMatrixRaw b;
+    double max0 = -1.0e200;
+    double min1 = 1.0e200;
+    double e, ndx, p;
+    double ll = 0.0;
+    int t;
+
+    gretl_matrix_init_full(&b, bin.k, 1, cast(double *) theta);
+    gretl_matrix_multiply(bin.X, &b, bin.Xb);
+
+    /* perfect prediction check */
+    for (t=0; t<bin.T; t++) {
+        ndx = gretl_vector_get(bin.Xb, t);
+        if (bin.y[t] == 0 && ndx > max0) {
+            max0 = ndx;
+        } else if (bin.y[t] == 1 && ndx < min1) {
+            min1 = ndx;
+        }
+    }
+    if (min1 > max0) {
+        bin.pp_err = 1;
+        return NADBL;
+    }
+
+    /* compute loglikelihood */
+    for (t=0; t<bin.T; t++) {
+        ndx = gretl_vector_get(bin.Xb, t);
+        if (bin.ci == GretlCmdIndex.probit) {
+            p = bin.y[t] ? normal_cdf(ndx) : normal_cdf(-ndx);
+        } else {
+            e = logit(ndx);
+            p = bin.y[t] ? e : 1-e;
+        }
+        ll += log(p);
+    }
+
+    return ll;
+}
+
+extern (C) int binary_score(double * theta, double * s, int k, BFGS_CRIT_FUNC ll, void * ptr)
+{
+    BinInfo * bin = cast(BinInfo *) ptr;
+    double ndx, w;
+    int t, j, yt;
+    int err = 0;
+
+    for (j=0; j<bin.k; j++) {
+        s[j] = 0.0;
+    }
+
+    for (t=0; t<bin.T; t++) {
+        yt = bin.y[t];
+        ndx = gretl_vector_get(bin.Xb, t);
+        if (bin.ci == GretlCmdIndex.probit) {
+            w = yt ? invmills(-ndx) : -invmills(ndx);
+        } else {
+            w = yt - logit(ndx);
+        }
+        for (j=0; j<bin.k; j++) {
+            s[j] += w * gretl_matrix_get(bin.X, t, j);
+        }
+    }
+
+    errno = 0;
+
+    return err;
+}
+
+/* binary probit/logit: form the negative of the analytical
+   Hessian */
+
+extern (C) int binary_hessian(double * theta, GretlMatrixRaw * H, void * data)
+{
+    BinInfo * bin = cast(BinInfo *) data;
+    double w, p, ndx, xtj;
+    int t, j;
+
+    for (t=0; t<bin.T; t++) {
+        ndx = gretl_vector_get(bin.Xb, t);
+        if (bin.ci == GretlCmdIndex.probit) {
+            w = bin.y[t] ? invmills(-ndx) : -invmills(ndx);
+            p = w * (ndx + w);
+        } else {
+            p = logit(ndx);
+            p = p * (1-p);
+        }
+        for (j=0; j<bin.k; j++) {
+            xtj = gretl_matrix_get(bin.X, t, j);
+            gretl_matrix_set(bin.pX, t, j, p * xtj);
+        }
+    }
+
+    gretl_matrix_multiply_mod(bin.pX, GretlMatrixMod.transpose,
+                              bin.X, GretlMatrixMod.none,
+                              H, GretlMatrixMod.none);
+
+    return 0;
+}
+
+GretlMatrixRaw * binary_hessian_inverse(BinInfo * bin, int * err)
+{
+    GretlMatrixRaw * H;
+
+    H = gretl_zero_matrix_new(bin.k, bin.k);
+    if (H == null) {
+        *err = GretlError.alloc;
+    } else {
+        *err = binary_hessian(bin.theta, H, bin);
+    }
+
+    if (!*err) {
+        *err = gretl_invert_symmetric_matrix(H);
+        if (*err) {
+            gretl_errmsg_set("Failed to invert binary model Hessian");
+        }
+    }
+
+    return H;
+}
+
+GretlMatrixRaw * binary_score_matrix(BinInfo * bin, int * err)
+{
+    GretlMatrixRaw * G;
+    double w, ndx, xtj;
+    int yt, j, t;
+
+    G = gretl_matrix_alloc(bin.T, bin.k);
+
+    if (G == null) {
+        *err = GretlError.alloc;
+        return null;
+    }
+
+    for (t=0; t<bin.T && !errno; t++) {
+        yt = bin.y[t];
+        ndx = gretl_vector_get(bin.Xb, t);
+        if (bin.ci == GretlCmdIndex.probit) {
+            w = yt ? invmills(-ndx) : -invmills(ndx);
+        } else {
+            w = yt - logit(ndx);
+        }
+        for (j=0; j<bin.k; j++) {
+            xtj = gretl_matrix_get(bin.X, t, j);
+            gretl_matrix_set(G, t, j, w * xtj);
+        }
+    }
+
+    return G;
+}
+
+int binary_variance_matrix(Model * pmod, BinInfo * bin, const(DatasetRaw) * dset, Gretlopt opt)
+{
+    GretlMatrixRaw * H = null;
+    GretlMatrixRaw * G = null;
+    int err = 0;
+
+    H = binary_hessian_inverse(bin, &err);
+
+    if (!err && (opt & Gretlopt.OPT_R)) {
+        G = binary_score_matrix(bin, &err);
+    }
+
+    if (!err) {
+        if (opt & Gretlopt.OPT_R) {
+            err = gretl_model_add_QML_vcv(pmod, bin.ci, H, G,
+                                          dset, opt, null);
+        } else {
+            err = gretl_model_add_hessian_vcv(pmod, H);
+        }
+    }
+
+    gretl_matrix_free(H);
+    gretl_matrix_free(G);
+
+    return err;
+}
+
+void binary_model_chisq(BinInfo * bin, Model * pmod, Gretlopt opt)
+{
+    double L0;
+
+    if (pmod.ncoeff == 1 && pmod.ifc) {
+        /* constant-only model */
+        pmod.chisq = NADBL;
+        pmod.rsq = 0;
+        pmod.adjrsq = NADBL;
+        return;
+    }
+
+    L0 = binary_null_loglik(bin.y, bin.T);
+
+    if (!na(L0) && L0 <= pmod.lnL) {
+        pmod.chisq = 2.0 * (pmod.lnL - L0);
+        add_pseudo_rsquared(pmod, L0, bin.k, bin.T, opt);
+    } else {
+        pmod.rsq = pmod.adjrsq = pmod.chisq = NADBL;
+    }
+}
+
+/* Binary probit normality test as in Bera, Jarque and Lee
+   (International Economic Review, 1984), also quoted in Verbeek,
+   chapter 7: we regress a column of 1s on the products of the
+   generalized residual with X, (X\beta)^2 and (X\beta)^3.  The test
+   statistic is T times the uncentered R-squared, and is distributed as
+   chi-square(2). It can be shown that this test is numerically
+   identical to the Chesher-Irish (87) test in the probit case
+   (although C&I make no mention of this in their article).
+*/
+
+int binary_probit_normtest(Model * pmod, BinInfo * bin)
+{
+    GretlMatrixBlock * B;
+    GretlMatrixRaw * X, y, b;
+    double xti, Xb, et;
+    int k = bin.k;
+    int i, s, t;
+    int err = 0;
+
+    B = gretl_matrix_block_new(&X, bin.T, k+2,
+                               &y, bin.T, 1,
+                               &b, k+2, 1,
+                               null);
+    if (B == null) {
+        return GretlError.alloc;
+    }
+
+    for (t=pmod.t1, s=0; t<=pmod.t2; t++) {
+        if (model_missing(pmod, t)) {
+            continue;
+        }
+        et = pmod.uhat[t];
+        Xb = gretl_vector_get(bin.Xb, s);
+        for (i=0; i<k; i++) {
+            xti = gretl_matrix_get(bin.X, s, i);
+            gretl_matrix_set(X, s, i, et * xti);
+        }
+        gretl_matrix_set(X, s, k, et * Xb * Xb);
+        gretl_matrix_set(X, s, k+1, et * Xb * Xb * Xb);
+        gretl_vector_set(y, s, 1);
+        s++;
+    }
+
+    err = gretl_matrix_ols(y, X, b, null, null, null);
+
+    if (!err) {
+        double X2 = bin.T;
+
+        gretl_matrix_multiply(X, b, y);
+        for (t=0; t<y.rows; t++) {
+            X2 -= (1 - y.val[t]) * (1 - y.val[t]);
+        }
+        if (X2 > 0) {
+            gretl_model_add_normality_test(pmod, X2);
+        }
+    }
+
+    gretl_matrix_block_destroy(B);
+
+    return err;
+}
+
+/* Special "slope" calculation for a dummy regressor in binary model:
+   this is F(~Xb + b_j) - F(~Xb) where ~Xb denotes the sum of
+   (coefficient times mean) for all regressors other than the dummy in
+   question and b_j indicates the coefficient on the dummy.  That is,
+   the calculation measures the effect on the probability of Y = 1 of
+   the discrete change 0 to 1 in x_j.
+*/
+
+double dumslope(Model * pmod, const(double) * xbar, int j)
+{
+    double s, Xb = 0.0;
+    int i;
+
+    for (i=0; i<pmod.ncoeff; i++) {
+        if (i != j) {
+            Xb += pmod.coeff[i] * xbar[i];
+        }
+    }
+
+    if (pmod.ci == GretlCmdIndex.logit) {
+        s = logit(Xb + pmod.coeff[j]) - logit(Xb);
+    } else {
+        s = normal_cdf(Xb + pmod.coeff[j]) - normal_cdf(Xb);
+    }
+
+    return s;
+}
+
+int binary_model_add_slopes(Model * pmod, BinInfo * bin, const(DatasetRaw) * dset)
+{
+    double * xbar;
+    double * slopes;
+    double Xb, fXb;
+    size_t ssize;
+    int i, vi, t;
+    int err = 0;
+
+    xbar = cast(typeof(xbar)) malloc(bin.k * (*xbar).sizeof);
+    ssize = bin.k * (*slopes).sizeof;
+    slopes = cast(typeof(slopes)) malloc(ssize);
+
+    if (slopes == null || xbar == null) {
+        free(xbar);
+        free(slopes);
+        return GretlError.alloc;
+    }
+
+    Xb = 0.0;
+    for (i=0; i<bin.k; i++) {
+        xbar[i] = 0.0;
+        vi = pmod.list[i+2];
+        for (t=pmod.t1; t<=pmod.t2; t++) {
+            if (!na(pmod.uhat[t])) {
+                xbar[i] += dset.Z[vi][t];
+            }
+        }
+        xbar[i] /= bin.T;
+        Xb += pmod.coeff[i] * xbar[i];
+    }
+
+    fXb = lp_pdf(Xb, bin.ci);
+    gretl_model_set_double(pmod, "fXb", fXb);
+
+    for (i=0; i<bin.k; i++) {
+        vi = pmod.list[i+2];
+        if (vi == 0) {
+            slopes[i] = 0.0;
+        } else if (gretl_isdummy(pmod.t1, pmod.t2, dset.Z[vi])) {
+            slopes[i] = dumslope(pmod, xbar, i);
+        } else {
+            slopes[i] = pmod.coeff[i] * fXb;
+        }
+    }
+
+    err = gretl_model_set_data(pmod, "slopes", slopes,
+                               GretlType.double_array,
+                               ssize);
+    free(xbar);
+    if (err) {
+        free(slopes);
+    }
+
+    return err;
+}
+
+double binary_model_fXb(Model * pmod, BinInfo * bin, const(DatasetRaw) * dset)
+{
+    double xbar, Xb = 0.0;
+    int i, vi, t;
+
+    for (i=0; i<bin.k; i++) {
+        xbar = 0.0;
+        vi = pmod.list[i+2];
+        for (t=pmod.t1; t<=pmod.t2; t++) {
+            if (!na(pmod.uhat[t])) {
+                xbar += dset.Z[vi][t];
+            }
+        }
+        xbar /= bin.T;
+        Xb += pmod.coeff[i] * xbar;
+    }
+
+    return bin.ci == GretlCmdIndex.logit ? logit_pdf(Xb) : normal_pdf(Xb);
+}
+
+void binary_model_hatvars(Model * pmod, const(GretlMatrixRaw) * ndx, const(int) * y, Gretlopt opt)
+{
+    int * act_pred;
+    double * ll = null;
+    double F;
+    int n = pmod.full_n;
+    int i, s, t;
+
+    /* add space for actual/predicted matrix */
+    act_pred = cast(typeof(act_pred)) malloc(4 * (*act_pred).sizeof);
+    if (act_pred != null) {
+        for (i=0; i<4; i++) {
+            act_pred[i] = 0;
+        }
+    }
+
+    if (!(opt & Gretlopt.OPT_E)) {
+        /* OPT_E indicates random effects */
+        ll = cast(typeof(ll)) malloc(n * (*ll).sizeof);
+        if (ll != null) {
+            for (t=0; t<n; t++) {
+                ll[t] = NADBL;
+            }
+        }
+    }
+
+    errno = 0;
+
+    for (t=pmod.t1, s=0; t<=pmod.t2; t++) {
+        double ndxt, endxt;
+        int yt;
+
+        if (model_missing(pmod, t)) {
+            continue;
+        }
+
+        ndxt = gretl_vector_get(ndx, s);
+        yt = y[s++];
+
+        if (act_pred != null) {
+            i = 2 * yt + (ndxt > 0.0);
+            act_pred[i] += 1;
+        }
+
+        if (pmod.ci == GretlCmdIndex.logit) {
+            endxt = exp(ndxt);
+            if (errno == ERANGE) {
+                F = (ndxt > 0)? 1 : 0;
+                errno = 0;
+            } else {
+                F = endxt / (1.0 + endxt);
+            }
+            pmod.yhat[t] = F;
+            pmod.uhat[t] = yt - pmod.yhat[t];
+        } else {
+            F = normal_cdf(ndxt);
+            pmod.yhat[t] = F;
+            pmod.uhat[t] = yt ? invmills(-ndxt) : -invmills(ndxt);
+        }
+
+        if (ll != null) {
+            ll[t] = yt ? log(F) : log(1-F);
+        }
+    }
+
+    if (act_pred != null) {
+        gretl_model_set_data(pmod, "discrete_act_pred", act_pred,
+                             GretlType.int_array,
+                             4 * (*act_pred).sizeof);
+    }
+    if (ll != null) {
+        gretl_model_set_data(pmod, "llt", ll,
+                             GretlType.double_array,
+                             n * (*ll).sizeof);
+    }
+}
+
+/* After a binary model is estimated via QR, multiply the
+   coefficients by R^{-1} to convert back to the statistics
+   of the original data.
+*/
+
+void binary_qr_finish_coeffs(Model * pmod, BinInfo * bin)
+{
+    GretlMatrixRaw bt;
+    GretlMatrixRaw pc;
+
+    gretl_matrix_init_full(&bt, bin.k, 1, bin.theta);
+    gretl_matrix_init_full(&pc, bin.k, 1, pmod.coeff);
+    gretl_matrix_multiply(bin.Ri, &bt, &pc);
+}
+
+/* After a binary model is estimated via QR, correct its covariance
+   matrix, V, which is relative to the decomposed data, to
+   R^{-1} * V * R^{-1}'.
+*/
+
+int binary_qr_finish_vcv(Model * pmod, BinInfo * bin)
+{
+    GretlMatrixRaw * V = null;
+    GretlMatrixRaw * RVR = null;
+    int err = 0;
+
+    RVR = gretl_matrix_alloc(bin.k, bin.k);
+    if (RVR == null) {
+        err = GretlError.alloc;
+    } else {
+        V = gretl_vcv_matrix_from_model(pmod, null, &err);
+    }
+
+    if (!err) {
+        gretl_matrix_qform(bin.Ri, GretlMatrixMod.none,
+                           V, RVR, GretlMatrixMod.none);
+        gretl_model_write_vcv(pmod, RVR);
+    }
+
+    gretl_matrix_free(RVR);
+    gretl_matrix_free(V);
+
+    return err;
+}
+
+int binary_model_finish(BinInfo * bin, Model * pmod, const(DatasetRaw) * dset, Gretlopt opt)
+{
+    memcpy(pmod.coeff, bin.theta, bin.k * double.sizeof);
+    pmod.ci = bin.ci;
+    pmod.lnL = binary_loglik(pmod.coeff, bin);
+
+    if (pmod.ci == GretlCmdIndex.probit && (opt & Gretlopt.OPT_X)) {
+        /* this model is just the starting-point for
+           random-effects probit estimation
+        */
+        if (bin.Ri != null) {
+            binary_qr_finish_coeffs(pmod, bin);
+        }
+        pmod.opt |= Gretlopt.OPT_P;
+        return 0;
+    }
+
+    binary_model_chisq(bin, pmod, opt);
+    pmod.errcode = binary_variance_matrix(pmod, bin, dset, opt);
+
+    if (!pmod.errcode) {
+        if (bin.Ri != null) {
+            binary_qr_finish_coeffs(pmod, bin);
+        }
+        if (opt & Gretlopt.OPT_P) {
+            /* showing p-values, not slopes */
+            double fXb = binary_model_fXb(pmod, bin, dset);
+
+            pmod.opt |= Gretlopt.OPT_P;
+            gretl_model_set_double(pmod, "fXb", fXb);
+        } else {
+            pmod.errcode = binary_model_add_slopes(pmod, bin, dset);
+        }
+    }
+
+    if (!pmod.errcode) {
+        binary_model_hatvars(pmod, bin.Xb, bin.y, opt);
+        mle_criteria(pmod, 0);
+        if (opt & Gretlopt.OPT_A) {
+            pmod.aux = ModelAuxCode.aux;
+        } else {
+            set_model_id(pmod, opt);
+        }
+        gretl_model_set_int(pmod, "binary", 1);
+    }
+
+    if (!pmod.errcode && bin.Ri != null) {
+        pmod.errcode = binary_qr_finish_vcv(pmod, bin);
+    }
+
+    if (!pmod.errcode) {
+        if (pmod.ci == GretlCmdIndex.probit) {
+            binary_probit_normtest(pmod, bin);
+        } else {
+            binary_logit_odds_ratios(pmod, dset);
+        }
+    }
+
+    return pmod.errcode;
+}
+
+/* revise_lpm_coeffs: here we're revising the coefficients we got via
+   initial OLS estimation (Linear Probability Model) when it turns out
+   OLS used QR decomposition and therefore we're going to use QR in ML
+   estimation of the binary model. In the non-QR case we just divide the
+   coeffs by pmod->sigma, but in the QR case we first obtain revised
+   coeffs as Q'y (where in context bin->X = Q).
+*/
+
+int revise_lpm_coeffs(BinInfo * bin, Model * pmod)
+{
+    GretlMatrixRaw * y = null;
+    GretlMatrixRaw b = {};
+    int i, err = 0;
+
+    y = gretl_matrix_alloc(bin.T, 1);
+    for (i=0; i<pmod.nobs; i++) {
+        y.val[i] = bin.y[i];
+    }
+    gretl_matrix_init_full(&b, bin.k, 1, bin.theta);
+    gretl_matrix_multiply_mod(bin.X, GretlMatrixMod.transpose,
+                              y, GretlMatrixMod.none,
+                              &b, GretlMatrixMod.none);
+    gretl_matrix_divide_by_scalar(&b, pmod.sigma);
+    gretl_matrix_free(y);
+
+    return err;
+}
+
+int make_binary_y_and_X(BinInfo * bin, Model * pmod, DatasetRaw * dset)
+{
+    int v = pmod.list[1];
+    int i, t, s;
+    int err = 0;
+
+    for (t=pmod.t1, s=0; t<=pmod.t2; t++) {
+        if (!na(pmod.yhat[t])) {
+            bin.y[s++] = dset.Z[v][t] ? 1 : 0;
+        }
+    }
+
+    if (gretl_model_get_int(pmod, "QR")) {
+        // fprintf(stderr, "make_binary_y_and_X: QR case\n".ptr);
+        bin.X = cast(typeof(bin.X)) gretl_model_steal_data(pmod, "Q");
+        bin.Ri = cast(typeof(bin.Ri)) gretl_model_steal_data(pmod, "R");
+        err = revise_lpm_coeffs(bin, pmod);
+    } else {
+        bin.X = gretl_matrix_alloc(bin.T, bin.k);
+        if (bin.X == null) {
+            err = GretlError.alloc;
+        }
+        for (i=0; i<bin.k && !err; i++) {
+            bin.theta[i] = pmod.coeff[i] / pmod.sigma;
+        }
+        for (i=0; i<bin.k && !err; i++) {
+            v = pmod.list[i+2];
+            for (t=pmod.t1, s=0; t<=pmod.t2; t++) {
+                if (!na(pmod.yhat[t])) {
+                    gretl_matrix_set(bin.X, s++, i, dset.Z[v][t]);
+                }
+            }
+        }
+    }
+
+    return err;
+}
+
+Model binary_model(int ci, const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    Gretlopt maxopt = Gretlopt.OPT_NONE;
+    int save_t1 = dset.t1;
+    int save_t2 = dset.t2;
+    int * blist = null;
+    char * mask = null;
+    double crittol = 1.0e-8;
+    double gradtol = 1.0e-7;
+    int maxit = 100;
+    int fncount = 0;
+    int ndropped = 0;
+    Model mod;
+    BinInfo * bin = null;
+    Prn * vprn = null;
+    int depvar;
+
+    gretl_model_init(&mod, dset);
+    depvar = list[1];
+
+    if (!gretl_isdummy(dset.t1, dset.t2, dset.Z[depvar])) {
+        gretl_errmsg_sprintf(_("'%s' is not a binary variable").ptr,
+                             dset.varname[depvar]);
+        mod.errcode = GretlError.data;
+        return mod;
+    }
+
+    blist = gretl_list_copy(list);
+    if (blist == null) {
+        mod.errcode = GretlError.alloc;
+        goto bailout;
+    }
+
+    /* the cluster option implies robust */
+    if (opt & Gretlopt.OPT_C) {
+        opt |= Gretlopt.OPT_R;
+    }
+
+    list_adjust_sample(blist, &dset.t1, &dset.t2, dset, null);
+
+    mask = classifier_check(blist, dset, prn, &ndropped, &mod.errcode);
+    if (mod.errcode) {
+        if (mod.errcode == GretlError.noconv) {
+            gretl_errmsg_set(_("Perfect prediction obtained: no MLE exists").ptr);
+        }
+    } else if (mask != null) {
+        mod.errcode = copy_to_reference_missmask(mask);
+    }
+
+    if (!mod.errcode) {
+        Gretlopt ols_opt = Gretlopt.OPT_A;
+
+        /* If we're doing logit/probit as an auxiliary regression,
+           it might be safer to abort on perfect collinearity;
+           otherwise we'll try automatic elimination.
+        */
+        if (opt & Gretlopt.OPT_A) {
+            ols_opt |= Gretlopt.OPT_Z;
+        }
+        /* Use OPT_B to activate QR for the binary model, if
+           needed, unless we get OPT_N, --no-qr.
+        */
+        if (!(opt & Gretlopt.OPT_N)) {
+            ols_opt |= Gretlopt.OPT_B;
+        }
+        mod = lsq(blist, dset, GretlCmdIndex.ols, ols_opt);
+    }
+
+    if (!mod.errcode) {
+        bin = bin_info_new(ci, mod.ncoeff, mod.nobs);
+        if (bin == null) {
+            mod.errcode = GretlError.alloc;
+        } else {
+            mod.errcode = make_binary_y_and_X(bin, &mod, dset);
+        }
+    }
+    if (mod.errcode) {
+        goto bailout;
+    }
+
+    if (opt & Gretlopt.OPT_V) {
+        /* respect verbosity */
+        maxopt = Gretlopt.OPT_V;
+        vprn = prn;
+    }
+    if (!(opt & Gretlopt.OPT_X)) {
+        /* not just an auxiliary estimator: respect user choices
+           for Newton parameters
+        */
+        maxopt |= Gretlopt.OPT_U;
+    }
+
+    mod.errcode = newton_raphson_max(bin.theta, bin.k, maxit,
+                                     crittol, gradtol, &fncount,
+                                     CriterionType.loglik, &binary_loglik,
+                                     &binary_score, &binary_hessian, bin,
+                                     maxopt, vprn);
+    if (bin.pp_err) {
+        /* trash any existing error message */
+        gretl_error_clear();
+        mod.errcode = GretlError.noconv;
+        gretl_errmsg_set(_("Perfect prediction obtained: no MLE exists").ptr);
+    }
+    if (!mod.errcode) {
+        binary_model_finish(bin, &mod, dset, opt);
+        if (!mod.errcode && ndropped > 0) {
+            gretl_model_set_int(&mod, "binary_obs_dropped", ndropped);
+        }
+        if (opt & Gretlopt.OPT_N) {
+            mod.opt |= Gretlopt.OPT_N;
+        }
+    free(mod.xlist);
+    mod.xlist = gretl_list_sublist(mod.list, 2, -1);
+    }
+
+ bailout:
+
+    bin_info_destroy(bin);
+    free(blist);
+    free(mask);
+
+    dset.t1 = save_t1;
+    dset.t2 = save_t2;
+
+    return mod;
+}
+
+/**
+ * binary_logit:
+ * @list: binary dependent variable plus list of regressors.
+ * @dset: dataset struct.
+ * @opt: if includes OPT_R form robust (QML) estimates of standard
+ * errors and covariance matrix; if OPT_P arrange for
+ * printing of p-values, not slopes at mean; if OPT_A treat as an
+ * auxiliary regression.
+ * @prn: printing struct in case additional information is
+ * wanted (in which case add OPT_V to @opt).
+ *
+ * Computes estimates of the logit model specified by @list,
+ * using Newton-Raphson.
+ *
+ * Returns: a #MODEL struct, containing the estimates.
+ */
+
+Model binary_logit(const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    return binary_model(GretlCmdIndex.logit, list, dset, opt, prn);
+}
+
+/**
+ * binary_probit:
+ * @list: binary dependent variable plus list of regressors.
+ * @dset: dataset struct.
+ * @opt: if includes OPT_R form robust (QML) estimates of standard
+ * errors and covariance matrix; if OPT_P arrange for
+ * printing of p-values, not slopes at mean; if OPT_A treat as an
+ * auxiliary regression.
+ * @prn: printing struct in case additional information is
+ * wanted (in which case add OPT_V to @opt).
+ *
+ * Computes estimates of the probit model specified by @list,
+ * using Newton-Raphson.
+ *
+ * Returns: a #MODEL struct, containing the estimates.
+ */
+
+Model binary_probit(const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    return binary_model(GretlCmdIndex.probit, list, dset, opt, prn);
+}
+
+/**
+ * ordered_logit:
+ * @list: ordinal dependent variable plus list of regressors.
+ * @dset: dataset struct.
+ * @opt: if includes OPT_R form robust (QML) estimates of standard
+ * errors and covariance matrix; if includes OPT_V, produce verbose
+ * output.
+ * @prn: printing struct in case additional information is
+ * wanted (OPT_V).
+ *
+ * Computes ML estimates of the ordered logit model specified by @list.
+ *
+ * Returns: a #MODEL struct, containing the estimates.
+ */
+
+Model ordered_logit(const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    Prn * vprn = (opt & Gretlopt.OPT_V)? prn : null;
+
+    return ordered_estimate(GretlCmdIndex.logit, list, dset, opt, vprn);
+}
+
+/**
+ * ordered_probit:
+ * @list: ordinal dependent variable plus list of regressors.
+ * @dset: dataset struct.
+ * @opt: if includes OPT_R form robust (QML) estimates of standard
+ * errors and covariance matrix; if includes OPT_V, produce verbose
+ * output.
+ * @prn: printing struct in case additional information is
+ * wanted (OPT_V).
+ *
+ * Computes ML estimates of the ordered probit model specified by @list.
+ *
+ * Returns: a #MODEL struct, containing the estimates.
+ */
+
+Model ordered_probit(const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    Prn * vprn = (opt & Gretlopt.OPT_V)? prn : null;
+
+    return ordered_estimate(GretlCmdIndex.probit, list, dset, opt, vprn);
+}
+
+/**
+ * multinomial_logit:
+ * @list: discrete dependent variable plus list of regressors.
+ * @dset: dataset struct.
+ * @opt: if includes OPT_R form robust (QML) estimates of standard
+ * errors and covariance matrix; if includes OPT_V, produce verbose
+ * output.
+ * @prn: printing struct in case additional information is
+ * wanted (OPT_V).
+ *
+ * Computes ML estimates of the multinomial model specified by @list.
+ *
+ * Returns: a #MODEL struct, containing the estimates.
+ */
+
+Model multinomial_logit(const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    Prn * vprn = (opt & Gretlopt.OPT_V)? prn : null;
+
+    return mnl_model(list, dset, opt, vprn);
+}
+
+/**
+ * logistic_ymax_lmax:
+ * @y: data series.
+ * @dset: dataset information.
+ * @ymax: location to receive max(y).
+ * @lmax: location to receive a guess at a suitable
+ * asymptote for a logistic curve fitted to @y.
+ *
+ * Checks that the non-missing values of @y are all positive,
+ * and if so writes the maximum value of @y to @ymax. The
+ * value written to @lmax is 1 if max(y) < 1, else 100
+ * if max(y) < 100, else 1.1 * max(y).
+ *
+ * Returns: 0 on success, non-zero on error.
+ */
+
+int logistic_ymax_lmax(const(double) * y, const(DatasetRaw) * dset, double * ymax, double * lmax)
+{
+    int t;
+
+    *ymax = 0.0;
+
+    for (t=dset.t1; t<=dset.t2; t++) {
+        if (na(y[t])) {
+            continue;
+        }
+        if (y[t] <= 0.0) {
+            gretl_errmsg_set(_("Illegal non-positive value of the dependent variable").ptr);
+            return 1;
+        }
+        if (y[t] > *ymax) {
+            *ymax = y[t];
+        }
+    }
+
+    if (*ymax < 1.0) {
+        *lmax = 1.0;
+    } else if (*ymax < 100.0) {
+        *lmax = 100.0;
+    } else {
+        /* admittedly arbitrary */
+        *lmax = 1.1 * *ymax;
+    }
+
+    return 0;
+}
+
+int make_logistic_depvar(DatasetRaw * dset, int dv, double lmax)
+{
+    int t, v = dset.v;
+    int err;
+
+    err = dataset_add_series(dset, 1);
+
+    if (!err) {
+        for (t=0; t<dset.n; t++) {
+            double p = dset.Z[dv][t];
+
+            if (na(p)) {
+                dset.Z[v][t] = NADBL;
+            } else {
+                dset.Z[v][t] = log(p / (lmax - p));
+            }
+        }
+    }
+
+    return err;
+}
+
+int rewrite_logistic_stats(const(DatasetRaw) * dset, Model * pmod, int dv, double lmax)
+{
+    double den, lam = PI/5.35;
+    double x, sigma, ess, jll, jaic;
+    int use_approx = 1;
+    int t;
+
+    if (pmod.depvar == null || *pmod.depvar == '\0') {
+        if (pmod.depvar == null) {
+            free(pmod.depvar);
+        }
+        pmod.depvar = gretl_strdup(dset.varname[dv]);
+    }
+
+    pmod.ybar = gretl_mean(pmod.t1, pmod.t2, dset.Z[dv]);
+    pmod.sdy = gretl_stddev(pmod.t1, pmod.t2, dset.Z[dv]);
+
+    if (pmod.vcv == null) {
+        /* make the VCV matrix before messing with the model stats */
+        makevcv(pmod, pmod.sigma);
+    }
+
+    if (use_approx) {
+        double s2 = pmod.sigma * pmod.sigma;
+
+        den = sqrt(1.0/(lam * lam) + s2);
+    }
+
+    ess = 0.0;
+    jll = pmod.lnL;
+
+    for (t=pmod.t1; t<=pmod.t2; t++) {
+        x = pmod.yhat[t];
+        if (!na(x)) {
+            if (use_approx) {
+                /* approximation via normal CDF */
+                pmod.yhat[t] = lmax * normal_cdf(x/den);
+            } else {
+                /* naive version */
+                pmod.yhat[t] = lmax / (1.0 + exp(-x));
+            }
+            pmod.uhat[t] = dset.Z[dv][t] - pmod.yhat[t];
+            ess += pmod.uhat[t] * pmod.uhat[t];
+            x = dset.Z[dv][t];
+            jll -= log(x * (lmax-x) / lmax);
+        }
+    }
+
+    sigma = sqrt(ess / pmod.dfd);
+    jaic = -2.0 * jll + 2 * pmod.ncoeff;
+
+    pmod.list[1] = dv;
+    gretl_model_set_double(pmod, "lmax", lmax);
+    gretl_model_set_double(pmod, "ess_orig", ess);
+    gretl_model_set_double(pmod, "sigma_orig", sigma);
+    gretl_model_set_double(pmod, "jll", jll);
+    gretl_model_set_double(pmod, "jaic", jaic);
+    pmod.ci = GretlCmdIndex.logistic;
+
+    if (!(pmod.opt & Gretlopt.OPT_F)) {
+        ls_criteria(pmod);
+    }
+
+    return 0;
+}
+
+double get_real_lmax(const(double) * y, const(DatasetRaw) * dset, double user_lmax)
+{
+    double ymax, lmax;
+    int err;
+
+    err = logistic_ymax_lmax(y, dset, &ymax, &lmax);
+    if (err) {
+        return NADBL;
+    }
+
+    if (!na(user_lmax)) {
+        if (user_lmax <= ymax) {
+            gretl_errmsg_set(_("Invalid value for the maximum of the dependent variable").ptr);
+            lmax = NADBL;
+        } else {
+            /* respect the user's choice */
+            lmax = user_lmax;
+        }
+    }
+
+    return lmax;
+}
+
+/**
+ * logistic_model:
+ * @list: dependent variable plus list of regressors.
+ * @lmax: value for the asymptote of the logistic curve, or
+ * %NADBL for automatic treatment of this.
+ * @dset: pointer to dataset.
+ * @opt: option flags.
+ *
+ * Estimate the model given in @list using the logistic transformation
+ * of the dependent variable.
+ *
+ * Returns: a #MODEL struct, containing the estimates.
+ */
+
+Model logistic_model(const(int) * list, double lmax, DatasetRaw * dset, Gretlopt opt)
+{
+    int * llist = null;
+    int dv = list[1];
+    double real_lmax;
+    Model lmod;
+    int err = 0;
+
+    gretl_model_init(&lmod, dset);
+
+    if ((opt & Gretlopt.OPT_F) && !dataset_is_panel(dset)) {
+        gretl_errmsg_set(_("This estimator requires panel data").ptr);
+        err = GretlError.data;
+    } else {
+        llist = gretl_list_copy(list);
+        if (llist == null) {
+            err = GretlError.alloc;
+        }
+    }
+
+    if (!err) {
+        real_lmax = get_real_lmax(dset.Z[dv], dset, lmax);
+        if (na(real_lmax)) {
+            err = GretlError.data;
+        }
+    }
+
+    if (!err) {
+        err = make_logistic_depvar(dset, dv, real_lmax);
+    }
+
+    if (err) {
+        free(llist);
+        lmod.errcode = err;
+        return lmod;
+    }
+
+    /* replace with transformed dependent variable */
+    llist[1] = dset.v - 1;
+
+    if (opt & Gretlopt.OPT_C) {
+        set_cluster_vcv_ci(GretlCmdIndex.logistic);
+    }
+
+    if (opt & Gretlopt.OPT_F) {
+        lmod = panel_model(llist, dset, opt, null);
+    } else {
+        lmod = lsq(llist, dset, GretlCmdIndex.ols, opt | Gretlopt.OPT_A);
+    }
+    if (!lmod.errcode) {
+        rewrite_logistic_stats(dset, &lmod, dv, real_lmax);
+        if (!(opt & Gretlopt.OPT_F)) {
+            /* already done, for the fixed-effects case */
+            set_model_id(&lmod, Gretlopt.OPT_NONE);
+        }
+    lmod.xlist = gretl_list_sublist(list, 2, -1);
+    }
+
+    if (opt & Gretlopt.OPT_C) {
+        set_cluster_vcv_ci(cast(GretlCmdIndex) 0);
+    }
+
+    dataset_drop_last_variables(dset, 1);
+    free(llist);
+
+    return lmod;
+}
+
+double choose(double n, double k, int * err)
+{
+    double c = 1.0;
+    int i;
+
+    for (i=0; i<k; i++) {
+        c *= (n - i) / (k - i);
+    }
+
+    if (na(c)) {
+        *err = 1;
+    }
+
+    return c;
+}
+
+double table_prob(double a, double b, double c, double d, double n, int * err)
+{
+    double p1, p2, p3, P = NADBL;
+
+    p1 = choose(a+b, a, err);
+    if (!*err) {
+        p2 = choose(c+d, c, err);
+    }
+    if (!*err) {
+        p3 = choose(n, a+c, err);
+    }
+
+    if (!*err) {
+        P = p1 * p2 / p3;
+        if (na(P)) {
+            *err = 1;
+            P = NADBL;
+        }
+    }
+
+    return P;
+}
+
+/**
+ * fishers_exact_test:
+ * @tab: pointer to 2 x 2 cross-tabulation struct.
+ * @prn: gretl printer.
+ *
+ * Computes and prints to @prn the p-value for Fisher's Exact Test for
+ * association between the two variables represented in @tab.
+ *
+ * Returns: 0 on successful completion, error code on error.
+ */
+
+int fishers_exact_test(const(Xtab) * tab, Prn * prn)
+{
+    double a, b, c, d, n, E0;
+    double P0, Pi, PL, PR, P2;
+    int err = 0;
+
+    if (tab.rows != 2 || tab.cols != 2) {
+        return GretlError.data;
+    }
+
+    if (tab.n > 1000) {
+        /* not worth trying? */
+        return GretlError.data;
+    }
+
+    a = tab.f[0][0];
+    b = tab.f[0][1];
+    c = tab.f[1][0];
+    d = tab.f[1][1];
+    n = tab.n;
+
+    E0 = (tab.rtotal[0] * tab.ctotal[0]) / n;
+
+    /* Probability of the observed table */
+    PL = PR = P2 = P0 = table_prob(a, b, c, d, n, &err);
+
+    if (!err) {
+        while (a > 0 && d > 0) {
+            a -= 1; d -= 1;
+            c += 1; b += 1;
+            Pi = table_prob(a, b, c, d, n, &err);
+            if (err) {
+                break;
+            }
+            if (Pi <= P0 || tab.f[0][0] > E0) {
+                PL += Pi;
+            }
+            if (Pi <= P0) {
+                P2 += Pi;
+            }
+        }
+    }
+
+    if (!err) {
+        a = tab.f[0][0];
+        b = tab.f[0][1];
+        c = tab.f[1][0];
+        d = tab.f[1][1];
+
+        while (c > 0 && b > 0) {
+            c -= 1; b -= 1;
+            a += 1; d += 1;
+            Pi = table_prob(a, b, c, d, n, &err);
+            if (err) {
+                break;
+            }
+            if (Pi <= P0 || tab.f[0][0] < E0) {
+                PR += Pi;
+            }
+            if (Pi <= P0) {
+                P2 += Pi;
+            }
+        }
+    }
+
+    if (!err) {
+        pprintf(prn, "\n%s:\n".ptr, _("Fisher's Exact Test").ptr);
+        pprintf(prn, _("  Left:   P-value = %g\n").ptr, PL);
+        pprintf(prn, _("  Right:  P-value = %g\n").ptr, PR);
+        pprintf(prn, _("  2-Tail: P-value = %g\n").ptr, P2);
+        pputc(prn, '\n');
+    }
+
+    return err;
+}
+
+/**
+ * interval_model:
+ * @list: high/low (2 variables) plus list of regressors.
+ * @dset: dataset struct.
+ * @opt: if includes %OPT_R form robust (QML) estimates of standard
+ * errors and covariance matrix; if includes %OPT_V give verbose
+ * operation.
+ * @prn: printing struct in case additional information is
+ * wanted (signalled via %OPT_V).
+ *
+ * Returns: a #MODEL struct, containing interval estimates of the
+ * model specified by @list.
+ */
+
+Model interval_model(const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    Model intmod;
+    alias IntervalEstimateFn = extern (C) Model function(const(int) *, DatasetRaw *, Gretlopt, Prn *);
+    IntervalEstimateFn interval_estimate;
+
+    gretl_error_clear();
+
+    interval_estimate = cast(IntervalEstimateFn) get_plugin_function("interval_estimate");
+
+    if (interval_estimate == null) {
+        gretl_model_init(&intmod, dset);
+        intmod.errcode = GretlError.fopen;
+        return intmod;
+    }
+
+    intmod = interval_estimate(list, dset, opt, prn);
+    set_model_id(&intmod, opt);
+
+    return intmod;
+}
+
+/**
+ * tobit_model:
+ * @list: dependent variable plus list of regressors.
+ * @llim: left bound on dependent variable; use #NADBL for
+ * no left-censoring.
+ * @rlim: right bound on dependent variable; use #NADBL for
+ * no right-censoring.
+ * @dset: dataset struct.
+ * @opt: may include OPT_V for verbose operation, OPT_R for
+ * robust (QML) standard errors.
+ * @prn: printing struct for iteration info (or NULL if this is not
+ * wanted).
+ *
+ * Produce Tobit estimates of the model given in @list.
+ *
+ * Returns: a #MODEL struct, containing the estimates.
+ */
+
+Model tobit_model(const(int) * list, double llim, double rlim, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    alias TobitEstimateFn = extern (C) Model function(const(int) *, double, double, DatasetRaw *, Gretlopt, Prn *);
+    TobitEstimateFn tobit_estimate;
+    Model tmod;
+
+    gretl_error_clear();
+
+    tobit_estimate = cast(TobitEstimateFn) get_plugin_function("tobit_via_intreg");
+    if (tobit_estimate == null) {
+        gretl_model_init(&tmod, dset);
+        tmod.errcode = GretlError.fopen;
+        return tmod;
+    }
+
+    tmod = tobit_estimate(list, llim, rlim, dset, opt, prn);
+    set_model_id(&tmod, opt);
+
+    return tmod;
+}
+
+/* Run several checks on the data supplied for a duration model, before
+   invoking the duration plugin to complete the business.
+*/
+
+int duration_precheck(const(int) * list, DatasetRaw * dset, Model * pmod, int * pcensvar)
+{
+    int * olslist = null;
+    int seppos, censvar = 0;
+    int l0 = list[0];
+    int err = 0;
+
+    /* such models must contain a constant */
+    if (!gretl_list_const_pos(list, 2, dset)) {
+        return GretlError.noconst;
+    }
+
+    /* if there's a separator, it must be in second-last place */
+    seppos = gretl_list_separator_position(list);
+    if (seppos > 0 && seppos != l0 - 1) {
+        return GretlError.parse;
+    }
+
+    if (seppos) {
+        /* The censoring variable, if present, must be a dummy. */
+        censvar = list[l0];
+        if (!gretl_isdummy(dset.t1, dset.t2, dset.Z[censvar])) {
+            gretl_errmsg_sprintf(_("The variable '%s' is not a 0/1 variable.").ptr,
+                                 dset.varname[censvar]);
+            err = GretlError.data;
+        } else {
+            olslist = gretl_list_copy(list);
+            if (olslist == null) {
+                err = GretlError.alloc;
+            } else {
+                /* include the censoring dummy to ensure the
+                   sample is right
+        */
+                olslist[l0 - 1] = censvar;
+                olslist[0] -= 1;
+            }
+        }
+    }
+
+    if (!err) {
+        /* Run an initial OLS to "set the model up" and check for errors;
+           the duration_estimate_driver function will overwrite the
+           coefficients etc.
+        */
+        if (olslist != null) {
+            *pmod = lsq(olslist, dset, GretlCmdIndex.ols, Gretlopt.OPT_A);
+            if (!pmod.errcode) {
+                /* remove reference to censoring var */
+                pmod.list[0] -= 1;
+                pmod.ncoeff -= 1;
+                pmod.dfn -= 1;
+                pmod.dfd += 1;
+            }
+            free(olslist);
+        } else {
+            *pmod = lsq(list, dset, GretlCmdIndex.ols, Gretlopt.OPT_A);
+        }
+        err = pmod.errcode;
+        *pcensvar = censvar;
+    if (!err) {
+        free(pmod.xlist);
+        pmod.xlist = gretl_list_sublist(pmod.list, 2, -1);
+    }
+    }
+
+    if (!err) {
+        int t, yno = pmod.list[1];
+
+        for (t=pmod.t1; t<=pmod.t2; t++) {
+            if (!na(pmod.uhat[t]) && dset.Z[yno][t] <= 0) {
+                gretl_errmsg_set(_("Durations must be positive").ptr);
+                err = GretlError.data;
+            }
+        }
+    }
+
+    return err;
+}
+
+/**
+ * duration_model:
+ * @list: dependent variable plus list of regressors.
+ * @dset: dataset struct.
+ * @opt: may include OPT_R for robust covariance matrix.
+ * @prn: printing struct for iteration info (or NULL is this is not
+ * wanted).
+ *
+ * Estimate the duration model given in @list using ML.
+ *
+ * Returns: a #MODEL struct, containing the estimates.
+ */
+
+Model duration_model(const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    Model dmod;
+    int censvar = 0;
+    alias DurationEstimateFn = extern (C) int function(Model *, int, const(DatasetRaw) *, Gretlopt, Prn *);
+    DurationEstimateFn duration_estimate;
+
+    gretl_error_clear();
+    gretl_model_init(&dmod, dset);
+
+    dmod.errcode = duration_precheck(list, dset, &dmod,
+                                     &censvar);
+    if (dmod.errcode) {
+        return dmod;
+    }
+
+    duration_estimate = cast(DurationEstimateFn) get_plugin_function("duration_estimate");
+
+    if (duration_estimate == null) {
+        dmod.errcode = GretlError.fopen;
+        return dmod;
+    }
+
+    duration_estimate(&dmod, censvar, dset, opt, prn);
+    set_model_id(&dmod, opt);
+
+    return dmod;
+}
+
+/* If the incoming list has a single member following LISTSEP, pull it
+   out of @list and return it. Otherwise leave @list unchanged and
+   return 0;
+*/
+
+int get_trailing_var(int * list)
+{
+    int l0 = list[0];
+    int ret = 0;
+
+    if (list[l0 - 1] == LISTSEP) {
+        ret = list[l0];
+        list[0] -= 2;
+    }
+
+    return ret;
+}
+
+/**
+ * count_model:
+ * @list: dependent variable plus list of regressors.
+ * @ci: either POISSON or NEGBIN.
+ * @dset: dataset struct.
+ * @opt: may include OPT_R for robust covariance matrix.
+ * @prn: printing struct for iteration info (or NULL is this is not
+ * wanted).
+ *
+ * Estimate the count data model given in @list using ML.
+ *
+ * Returns: a #MODEL struct, containing the estimates.
+ */
+
+Model count_model(const(int) * list, int ci, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    Model cmod;
+    int * listcpy;
+    int offvar;
+    alias CountDataEstimateFn = extern (C) int function(Model *, int, int, DatasetRaw *, Gretlopt, Prn *);
+    CountDataEstimateFn count_data_estimate;
+
+    gretl_error_clear();
+
+    gretl_model_init(&cmod, dset);
+
+    if (!gretl_iscount(dset.t1, dset.t2, dset.Z[list[1]])) {
+        gretl_errmsg_sprintf(_("%s: the dependent variable must be count data").ptr,
+                             gretl_command_word(ci));
+        cmod.errcode = GretlError.data;
+        return cmod;
+    }
+
+    listcpy = gretl_list_copy(list);
+    if (listcpy == null) {
+        cmod.errcode = GretlError.alloc;
+        return cmod;
+    }
+
+    offvar = get_trailing_var(listcpy);
+
+    /* Run an initial OLS to "set the model up" and check for errors.
+       The count_data_estimate() function will overwrite the
+       coefficients, etc.
+    */
+    cmod = lsq(listcpy, dset, GretlCmdIndex.ols, Gretlopt.OPT_A);
+    free(listcpy);
+
+    if (cmod.errcode) {
+        return cmod;
+    } else {
+    cmod.xlist = gretl_list_sublist(cmod.list, 2, -1);
+    }
+
+    count_data_estimate = cast(CountDataEstimateFn) get_plugin_function("count_data_estimate");
+    if (count_data_estimate == null) {
+        cmod.errcode = GretlError.fopen;
+        return cmod;
+    }
+
+    count_data_estimate(&cmod, ci, offvar, dset, opt, prn);
+    set_model_id(&cmod, opt);
+
+    return cmod;
+}
+
+/**
+ * heckit_model:
+ * @list: dependent variable plus list of regressors.
+ * @dset: dataset struct.
+ * @opt: option flags (may include OPT_V for verbose output).
+ * @prn: printing struct for iteration info (or NULL is this is not
+ * wanted).
+ *
+ * Produce Heckit estimates of the model given in @list. The list must
+ * include a separator to divide the main equation from the selection
+ * equation.
+ *
+ * Returns: a #MODEL struct, containing the estimates.
+ */
+
+Model heckit_model(const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    Model model;
+    alias HeckitEstimateFn = extern (C) Model function(const(int) *, DatasetRaw *, Gretlopt, Prn *);
+    HeckitEstimateFn heckit_estimate;
+
+    gretl_error_clear();
+
+    heckit_estimate = cast(HeckitEstimateFn) get_plugin_function("heckit_estimate");
+    if (heckit_estimate == null) {
+        gretl_model_init(&model, dset);
+        model.errcode = GretlError.fopen;
+        return model;
+    }
+
+    model = heckit_estimate(list, dset, opt, prn);
+    set_model_id(&model, opt);
+
+    return model;
+}
+
+/**
+ * reprobit_model:
+ * @list: dependent variable plus list of regressors.
+ * @dset: dataset struct.
+ * @opt: option flags (may include OPT_V for verbose output).
+ * @prn: printing struct for iteration info (or NULL if this is not
+ * wanted).
+ *
+ * Produce random-effects probit estimates of the model given in @list.
+ *
+ * Returns: a #MODEL struct, containing the estimates.
+ */
+
+Model reprobit_model(const(int) * list, DatasetRaw * dset, Gretlopt opt, Prn * prn)
+{
+    Model model;
+    alias ReprobitEstimateFn = extern (C) Model function(const(int) *, DatasetRaw *, Gretlopt, Prn *);
+    ReprobitEstimateFn reprobit_estimate;
+    int err = 0;
+
+    gretl_error_clear();
+
+    if (!dataset_is_panel(dset)) {
+        err = GretlError.pdwrong;
+    } else {
+        reprobit_estimate = cast(ReprobitEstimateFn) get_plugin_function("reprobit_estimate");
+        if (reprobit_estimate == null) {
+            err = GretlError.fopen;
+        }
+    }
+
+    if (err) {
+        gretl_model_init(&model, dset);
+        model.errcode = err;
+        return model;
+    }
+
+    model = reprobit_estimate(list, dset, opt, prn);
+    set_model_id(&model, opt);
+
+    return model;
+}
+
+/* apparatus for computing all permutations of @k 1s in @n bits */
+
+/* The following clever algorithm to calculate the "next permutation"
+   of bits in lexicographic order is attributed to Dario Sneidermanis
+   at https://stackoverflow.com/questions/1851134/
+   generate-all-binary-strings-of-length-n-with-k-bits-set
+*/
+
+ulong next_perm(ulong v)
+{
+    ulong w; /* next permutation of bits */
+
+    /* t gets v's least significant 0 bits set to 1 */
+    ulong t = v | (v - 1L);
+    /* Next set to 1 the most significant bit to change, set to 0 the
+       least significant ones, and add the necessary 1 bits.
+    */
+    w = (t + 1L) | (((~t & -~t) - 1L) >> (bsf(v) + 1L));
+
+    return w;
+}
+
+void binrow(int i, int n, ulong val, GretlMatrixRaw * m)
+{
+    int k, j = 0;
+
+    for (k=n-1; k>=0; k--) {
+        if (val & (1L << k)) {
+            gretl_matrix_set(m, i, j, 1);
+        }
+        j++;
+    }
+}
+
+int nperms(int n, int k)
+{
+    double num = lngamma(n+1);
+    double den1 = lngamma(k+1);
+    double den2 = lngamma(n-k+1);
+
+    return cast(int) nearbyint(exp(num - (den1 + den2)));
+}
+
+GretlMatrixRaw * bit_permutations(int n, int k, int * err)
+{
+    GretlMatrixRaw * ret;
+    ulong v = 0, vmax = 0;
+    int i, np = 0;
+
+    if (n > 64) {
+        gretl_errmsg_set(_("binperms: n must be <= 64").ptr);
+        *err = GretlError.invarg;
+        return null;
+    }
+
+    if (n < 0 || k < 0 || n < k) {
+    gretl_errmsg_set(_("binperms: we need n >= k >= 0").ptr);
+    *err = GretlError.invarg;
+    return null;
+    } else if (n == 0 && k == 0) {
+    ret = gretl_zero_matrix_new(1, 0);
+    } else if (k == n) {
+        ret = gretl_unit_matrix_new(1, n);
+    } else if (k == 0) {
+        ret = gretl_zero_matrix_new(1, n);
+    } else if (k == 1) {
+        ret = gretl_zero_matrix_new(n, n);
+        if (ret != null) {
+            for (i = n-1; i<n*n-1; i += n-1) {
+                ret.val[i] = 1.0;
+            }
+        }
+    } else if (k == n - 1) {
+        ret = gretl_unit_matrix_new(n, n);
+        if (ret != null) {
+            for (i=0; i<n; i++) {
+                gretl_matrix_set(ret, i, i, 0);
+            }
+        }
+    } else {
+        np = nperms(n, k);
+        ret = gretl_zero_matrix_new(np, n);
+    }
+
+    if (ret == null) {
+        *err = GretlError.alloc;
+        return null;
+    } else if (np == 0) {
+        /* result already settled */
+        return ret;
+    }
+
+    /* set the min and max of @v */
+    for (i=0; i<k; i++) {
+        v |= (1L << i);
+        vmax |= (1L << (n-1-i));
+    }
+
+    /* run the iteration */
+    for (i=0; i<np; i++) {
+        binrow(i, n, v, ret);
+    if (i < np - 1) {
+            v = next_perm(v);
+        }
+    }
+
+    if (v != vmax) {
+    /* "can't happen" */
+    fprintf(stderr, "binperms: something went wrong!\n".ptr);
+    }
+
+    return ret;
+}

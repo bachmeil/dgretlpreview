@@ -1,0 +1,12 @@
+build/
+.dub/
+*.o
+*.obj
+*.lib
+*.exe
+*.dll
+guide/html/
+guide/kansas
+guide/kansas.png
+*~
+*.swp

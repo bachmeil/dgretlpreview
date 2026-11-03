@@ -1,0 +1,132 @@
+/* Style sheet for the dgretl guide, used by pandoc/template.html. */
+
+:root {
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --muted: #59636e;
+  --link: #0b5cad;
+  --rule: #d1d9e0;
+  --code-bg: #f4f6f8;
+  --accent: #b03a2e;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181d;
+    --fg: #d7dde3;
+    --muted: #97a1ab;
+    --link: #6cb2f2;
+    --rule: #333b44;
+    --code-bg: #1d232a;
+    --accent: #e8806f;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { font-size: 17px; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.6;
+}
+
+main {
+  max-width: 50rem;
+  margin: 0 auto;
+  padding: 1rem 1.25rem 3rem;
+}
+
+header.site, footer.site {
+  max-width: 50rem;
+  margin: 0 auto;
+  padding: 0.75rem 1.25rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+header.site { border-bottom: 1px solid var(--rule); }
+footer.site { border-top: 1px solid var(--rule); margin-top: 2rem; }
+header.site .sep { margin: 0 0.4rem; }
+
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+h1, h2, h3, h4 {
+  line-height: 1.25;
+  margin: 1.8rem 0 0.6rem;
+}
+
+h1 { font-size: 2rem; margin-top: 1rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--rule); }
+h2 { font-size: 1.4rem; }
+h3 { font-size: 1.15rem; }
+
+p, ul, ol, table, pre, blockquote { margin: 0.8rem 0; }
+
+ul, ol { padding-left: 1.6rem; }
+li { margin: 0.25rem 0; }
+li > ul, li > ol { margin: 0.2rem 0; }
+
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.88em;
+}
+
+code {
+  background: var(--code-bg);
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+}
+
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  padding: 0.8rem 1rem;
+  overflow-x: auto;
+  line-height: 1.45;
+}
+
+pre code { background: none; padding: 0; font-size: 1em; }
+
+table {
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+}
+
+th, td {
+  border: 1px solid var(--rule);
+  padding: 0.35rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+th { background: var(--code-bg); }
+
+blockquote {
+  border-left: 3px solid var(--rule);
+  margin-left: 0;
+  padding-left: 1rem;
+  color: var(--muted);
+}
+
+img { max-width: 100%; height: auto; }
+
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }
+
+/* the "Output:" paragraph that precedes the output block of an example */
+p + pre { margin-top: 0.4rem; }
+
+@media (max-width: 40rem) {
+  html { font-size: 16px; }
+  main { padding: 0.5rem 1rem 2rem; }
+}
+
+@media print {
+  header.site, footer.site { display: none; }
+  pre { white-space: pre-wrap; }
+}
