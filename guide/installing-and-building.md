@@ -104,7 +104,7 @@ your project's `dub.sdl`:
 dependency "dgretl" path="/path/to/dgretlpreview"
 ```
 
-(or `dependency "dgretl" repository="git+https://github.com/bachmeil/dgretlpreview.git" version="<commit>"`) and write
+(or `dependency "dgretl" repository="git+https://github.com/bachmeil/dgretlpreview.git" version="a6133f8cb9cff8864db294ea87b14ab45155fb78"`, where the version is a commit hash, here the one tagged `v0.1.0`) and write
 `import dgretl;` in your code. dub also builds the `dgretl:stubs` sub-package, the aborting stand-ins for the unported
 functions, and links libxml2, zlib, LAPACK, BLAS and FFTW3. The build works with `dub build --compiler=ldc2` and with
 dmd; `-b release` makes a faster library.

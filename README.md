@@ -34,8 +34,10 @@ The port is a translation of gretl 2023c, and the original C is not part of this
 With dub (the libraries libxml2, zlib, LAPACK, BLAS and FFTW3 must be installed; LDC 1.39 or later, or dmd):
 
 ```sdl
-dependency "dgretl" repository="git+https://github.com/bachmeil/dgretlpreview.git" version="<commit or tag>"
+dependency "dgretl" repository="git+https://github.com/bachmeil/dgretlpreview.git" version="a6133f8cb9cff8864db294ea87b14ab45155fb78"
 ```
+
+dub wants a commit hash here, not a tag name; the one above is the commit tagged `v0.1.0`.
 
 Or clone the repository and use `dependency "dgretl" path="/path/to/dgretlpreview"`.
 
